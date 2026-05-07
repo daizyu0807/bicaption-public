@@ -1,0 +1,5 @@
+# Clean packaging venv proposal: optional local LLM rewrite path.
+# Torch-free status is not proven; do not promote until import/generation gates pass.
+mlx==0.29.3
+mlx-metal==0.29.3
+mlx-lm==0.29.1

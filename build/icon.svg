@@ -1,0 +1,33 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="250" y1="156" x2="800" y2="870" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1963D5"/>
+      <stop offset="0.58" stop-color="#0E4BB1"/>
+      <stop offset="1" stop-color="#07368F"/>
+    </linearGradient>
+    <linearGradient id="metal" x1="304" y1="264" x2="784" y2="780" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFF9EC"/>
+      <stop offset="0.2" stop-color="#E8DCC0"/>
+      <stop offset="0.45" stop-color="#FBF7EF"/>
+      <stop offset="0.7" stop-color="#D4C29B"/>
+      <stop offset="1" stop-color="#FFF4D8"/>
+    </linearGradient>
+    <linearGradient id="fold" x1="654" y1="210" x2="778" y2="336" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFDF7"/>
+      <stop offset="0.45" stop-color="#D8C8A8"/>
+      <stop offset="1" stop-color="#B89F75"/>
+    </linearGradient>
+    <filter id="shadow" x="36" y="88" width="920" height="900" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="18" stdDeviation="20" flood-color="#042F7C" flood-opacity="0.22"/>
+    </filter>
+  </defs>
+
+  <rect x="56" y="56" width="912" height="912" rx="216" fill="url(#bg)"/>
+
+  <g filter="url(#shadow)" transform="translate(-161 -83) scale(1.239)">
+    <path d="M344 262C344 237.699 363.699 218 388 218H632L742 330V650C742 674.301 722.301 694 698 694H388C363.699 694 344 674.301 344 650V262Z" stroke="url(#metal)" stroke-width="20" stroke-linejoin="round"/>
+    <path d="M632 218V286C632 310.301 651.699 330 676 330H742" stroke="url(#metal)" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M632 218L742 330L680 330C653.49 330 632 308.51 632 282V218Z" fill="url(#fold)"/>
+    <path d="M208 500H308C320 500 332.073 491.622 340.528 468.593L378.472 365.407C384.202 349.822 398.534 339.46 413 339.46C427.466 339.46 441.798 349.822 447.528 365.407L507.472 628.593C513.202 644.178 527.534 654.54 542 654.54C556.466 654.54 570.798 644.178 576.528 628.593L636.472 427.407C642.202 411.822 656.534 401.46 671 401.46C685.466 401.46 699.798 411.822 705.528 427.407L734.472 506.593C742.927 529.622 754.999 538 767 538H878" stroke="url(#metal)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

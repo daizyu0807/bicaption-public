@@ -1,0 +1,8 @@
+sherpa-onnx>=1.10.0
+numpy<2
+sounddevice>=0.4.7
+deep-translator>=1.11.4
+opencc-python-reimplemented>=0.1.7
+mlx==0.29.3
+mlx-metal==0.29.3
+mlx-lm==0.29.1

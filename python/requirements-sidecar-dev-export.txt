@@ -1,0 +1,8 @@
+# Clean packaging venv proposal: development/export/data tooling.
+# These dependencies must not enter the clean sidecar packaging venv unless a feature gate proves they are required.
+torch
+opencv-python
+pandas
+pyarrow
+datasets
+pillow

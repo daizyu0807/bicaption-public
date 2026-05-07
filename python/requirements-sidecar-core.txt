@@ -1,0 +1,7 @@
+# Clean packaging venv proposal: core sidecar runtime.
+# Not used by current builds until explicitly promoted.
+sherpa-onnx>=1.10.0
+numpy<2
+sounddevice>=0.4.7
+deep-translator>=1.11.4
+opencc-python-reimplemented>=0.1.7

@@ -1,0 +1,129 @@
+{
+  "name": "bicaption",
+  "version": "0.1.7",
+  "description": "Realtime bilingual caption overlay for macOS — local STT with SenseVoice + Google Translate",
+  "license": "MIT",
+  "author": "davedai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/daizyu0807/bicaption-public"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "main": "dist/electron/main.js",
+  "scripts": {
+    "dev": "node scripts/dev-electron.mjs",
+    "build": "npm run build:electron && npm run build:renderer",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "build:renderer": "node scripts/run-vite.mjs build",
+    "build:global-hotkey": "bash scripts/build-global-hotkey.sh",
+    "build:sidecar": "bash scripts/build-sidecar.sh",
+    "build:sidecar:full": "BICAPTION_INCLUDE_LOCAL_LLM=1 bash scripts/build-sidecar.sh",
+    "dist": "npm run build && npm run build:global-hotkey && npm run build:sidecar && electron-builder --mac && npm run verify:app",
+    "dist:unsigned": "npm run build && npm run build:global-hotkey && npm run build:sidecar && electron-builder --mac --config.mac.identity=null",
+    "install:local-app": "bash scripts/install-local-app.sh",
+    "verify:app": "bash scripts/verify-app-artifact.sh",
+    "type-check": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.electron.json",
+    "test": "tsx --test tests/**/*.test.ts",
+    "test:sidecar": ".venv/bin/python -m unittest python.tests.test_sidecar -v",
+    "sidecar:deps": "bash scripts/analyze-sidecar-deps.sh",
+    "sidecar:torch-gate": "bash scripts/verify-torch-free-import.sh",
+    "sidecar:venv:dry-run": "bash scripts/prepare-sidecar-packaging-venv.sh --dry-run --with-build-tool",
+    "sidecar:venv:local-llm-dry-run": "bash scripts/prepare-sidecar-packaging-venv.sh --dry-run --with-local-llm --with-build-tool",
+    "sidecar:legacy-packaging-gate": "bash scripts/check-sidecar-legacy-packaging.sh",
+    "check:sidecar-dev": "npm run sidecar:legacy-packaging-gate && npm run sidecar:torch-gate && npm run sidecar:venv:dry-run && npm run sidecar:deps",
+    "check:dev-acceptance": "npm run check:sidecar-dev && npm run type-check && npm test && npm run test:sidecar",
+    "start": "electron ."
+  },
+  "dependencies": {
+    "electron-store": "^10.1.0",
+    "electron-updater": "^6.8.3",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.17.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.1.0",
+    "electron": "^37.2.0",
+    "electron-builder": "^26.8.1",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.3"
+  },
+  "build": {
+    "appId": "com.davedai.bicaption",
+    "productName": "BiCaption",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/electron/**/*",
+      "dist/renderer/**/*",
+      "electron/preload.cjs"
+    ],
+    "extraResources": [
+      {
+        "from": "python/dist/bicaption-sidecar",
+        "to": "sidecar"
+      },
+      {
+        "from": "python/global-hotkey",
+        "to": "sidecar/global-hotkey"
+      },
+      {
+        "from": "build/icon_1024_norm.png",
+        "to": "icon_1024_norm.png"
+      },
+      {
+        "from": "build/trayTemplate.png",
+        "to": "trayTemplate.png"
+      },
+      {
+        "from": "build/trayTemplate@2x.png",
+        "to": "trayTemplate@2x.png"
+      },
+      {
+        "from": "AppleSTTHelper.app",
+        "to": "AppleSTTHelper.app"
+      }
+    ],
+    "afterPack": "scripts/afterPack.cjs",
+    "mac": {
+      "icon": "build/icon.icns",
+      "category": "public.app-category.utilities",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": "arm64"
+        },
+        {
+          "target": "zip",
+          "arch": "arm64"
+        }
+      ],
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.inherit.plist",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "BiCaption needs microphone access to capture audio for real-time speech recognition.",
+        "NSSpeechRecognitionUsageDescription": "BiCaption needs speech recognition access to provide Apple native speech-to-text features.",
+        "NSAudioCaptureUsageDescription": "BiCaption needs audio capture access to capture system audio for real-time subtitles.",
+        "NSScreenCaptureUsageDescription": "BiCaption needs screen capture access to capture system audio for real-time subtitles."
+      }
+    },
+    "dmg": {
+      "title": "BiCaption ${version}",
+      "artifactName": "BiCaption-${version}-${arch}.${ext}"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "daizyu0807",
+      "repo": "bicaption-public"
+    }
+  }
+}
