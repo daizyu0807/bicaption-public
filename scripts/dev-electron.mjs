@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { access } from 'node:fs/promises';
+import { access, readFile } from 'node:fs/promises';
 import { constants, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import process from 'node:process';
@@ -13,6 +13,33 @@ const electronDistFiles = [
 const projectRoot = process.cwd();
 const pythonDir = join(projectRoot, 'python');
 const venvPython = join(projectRoot, '.venv', 'bin', 'python');
+
+async function loadDotEnvFile() {
+  const envPath = join(projectRoot, '.env');
+  if (!existsSync(envPath)) {
+    return;
+  }
+  const text = await readFile(envPath, 'utf8');
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) {
+      continue;
+    }
+    const separatorIndex = line.indexOf('=');
+    if (separatorIndex <= 0) {
+      continue;
+    }
+    const key = line.slice(0, separatorIndex).trim();
+    let value = line.slice(separatorIndex + 1).trim();
+    if (!key || process.env[key] !== undefined) {
+      continue;
+    }
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    process.env[key] = value;
+  }
+}
 
 function failPreflight(message, steps = []) {
   console.error(`\n[dev preflight] ${message}`);
@@ -118,6 +145,7 @@ process.on('SIGTERM', stopChildren);
 process.on('exit', stopChildren);
 
 async function main() {
+  await loadDotEnvFile();
   assertNodeDependenciesInstalled();
   assertPythonReady();
   warnIfModelsMissing();
@@ -131,7 +159,7 @@ async function main() {
   await once(vite, 'spawn');
   await waitForElectronDist();
 
-  const electron = start(localBin('electron'), ['.'], {
+  const electron = start(localBin('electron'), ['.', ...(process.env.BICAPTION_DEV_DEBUG_PORT ? ['--remote-debugging-port=' + process.env.BICAPTION_DEV_DEBUG_PORT] : [])], {
     env: {
       ...process.env,
       VITE_DEV_SERVER_URL: 'http://127.0.0.1:5174',

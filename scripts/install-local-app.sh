@@ -22,11 +22,14 @@ info "Target: $TARGET_APP"
 
 pkill -x BiCaption >/dev/null 2>&1 || true
 
-# Reset app-level TCC entries before reinstall so macOS re-authorizes the new build cleanly.
-tccutil reset Accessibility com.davedai.bicaption >/dev/null 2>&1 || true
-tccutil reset ListenEvent com.davedai.bicaption >/dev/null 2>&1 || true
-tccutil reset ScreenCapture com.davedai.bicaption >/dev/null 2>&1 || true
-tccutil reset ScreenCapture com.davedai.bicaption.apple-stt-helper >/dev/null 2>&1 || true
+if [ "${BICAPTION_RESET_TCC:-0}" = "1" ]; then
+  info "Resetting app-level TCC entries because BICAPTION_RESET_TCC=1"
+  tccutil reset Accessibility com.davedai.bicaption >/dev/null 2>&1 || true
+  tccutil reset ListenEvent com.davedai.bicaption >/dev/null 2>&1 || true
+  tccutil reset ListenEvent com.davedai.bicaption.global-hotkey-helper >/dev/null 2>&1 || true
+  tccutil reset ScreenCapture com.davedai.bicaption >/dev/null 2>&1 || true
+  tccutil reset ScreenCapture com.davedai.bicaption.apple-stt-helper >/dev/null 2>&1 || true
+fi
 
 rm -rf "$TARGET_APP"
 # Preserve bundle metadata and signatures when installing into /Applications.

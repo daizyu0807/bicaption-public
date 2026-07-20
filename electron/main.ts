@@ -89,9 +89,15 @@ function isRecoverableGroqWhisperQuotaError(event: SidecarEvent): event is Extra
     && event.code === 'groq_whisper_quota_exceeded';
 }
 
-function fallbackDictationSttToAppleStt() {
+function isRecoverableBreezeAsrError(event: SidecarEvent): event is Extract<SidecarEvent, { type: 'error' }> {
+  return event.type === 'error'
+    && event.mode === 'dictation'
+    && (event.code === 'breeze_asr_unavailable' || event.code === 'breeze_asr_failed');
+}
+
+function fallbackDictationSttToAppleStt(expectedModel: 'groq-whisper' | 'breeze-asr-25') {
   const settings = loadSettings();
-  if (settings.dictationSttModel !== 'groq-whisper') {
+  if (settings.dictationSttModel !== expectedModel) {
     return false;
   }
   const nextSettings = saveSettings({
@@ -710,9 +716,26 @@ function getSubtitleOverlayBounds() {
   return getDefaultSubtitleOverlayBounds();
 }
 
-function getDefaultDictationOverlayBounds() {
-  const primary = screen.getPrimaryDisplay();
-  const workArea = primary.workArea;
+function getDictationTargetDisplay() {
+  if (
+    pendingDictationPasteTarget
+    && pendingDictationPasteTarget.windowX !== null
+    && pendingDictationPasteTarget.windowY !== null
+    && pendingDictationPasteTarget.windowWidth !== null
+    && pendingDictationPasteTarget.windowHeight !== null
+  ) {
+    return screen.getDisplayMatching({
+      x: pendingDictationPasteTarget.windowX,
+      y: pendingDictationPasteTarget.windowY,
+      width: Math.max(1, pendingDictationPasteTarget.windowWidth),
+      height: Math.max(1, pendingDictationPasteTarget.windowHeight),
+    });
+  }
+  return screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+}
+
+function getDefaultDictationOverlayBounds(targetDisplay = getDictationTargetDisplay()) {
+  const workArea = targetDisplay.workArea;
   const x = Math.round(workArea.x + (workArea.width - DICTATION_OVERLAY_SIZE) / 2);
   const y = Math.round(workArea.y + workArea.height - DICTATION_OVERLAY_SIZE - 128);
   return {
@@ -724,7 +747,14 @@ function getDefaultDictationOverlayBounds() {
 }
 
 function getDictationOverlayBounds() {
-  return dictationOverlayBoundsCache ?? getDefaultDictationOverlayBounds();
+  const targetDisplay = getDictationTargetDisplay();
+  if (dictationOverlayBoundsCache) {
+    const cachedDisplay = screen.getDisplayMatching(dictationOverlayBoundsCache);
+    if (cachedDisplay.id === targetDisplay.id) {
+      return dictationOverlayBoundsCache;
+    }
+  }
+  return getDefaultDictationOverlayBounds(targetDisplay);
 }
 
 function restoreSubtitleOverlayBounds() {
@@ -760,6 +790,9 @@ async function handleDictationFinal(event: SidecarEvent) {
     } else {
       const pasted = await tryPasteClipboard(outputAction, pendingDictationPasteTarget);
       const fallbackDetail = pasted ? 'Pasted into foreground app.' : await getPasteFallbackDetail();
+      traceMain(
+        `dictation output action=${outputAction} status=${pasted ? 'pasted' : 'fallback'} detail=${fallbackDetail}`,
+      );
       sendToWindows('dictation:output-status', {
         type: 'dictation_output_status',
         action: outputAction,
@@ -943,6 +976,11 @@ async function tryPasteClipboard(action: DictationOutputAction, expectedTarget: 
 function buildSessionConfig(settings: AppSettings, mode: SessionMode): CaptionConfig {
   const isDictation = mode === 'dictation';
   const isMeeting = mode === 'meeting';
+  const subtitleTranslateModel = settings.sttModel === 'gemini-live'
+    ? 'gemini-live'
+    : settings.translateModel === 'gemini-live'
+      ? 'google'
+      : settings.translateModel;
   const meetingPrimaryDeviceId = settings.meetingSourceMode === 'system-audio'
     ? settings.meetingSystemAudioDeviceId
     : settings.meetingMicDeviceId;
@@ -957,7 +995,7 @@ function buildSessionConfig(settings: AppSettings, mode: SessionMode): CaptionCo
     sourceLang: isMeeting ? settings.meetingSourceLang : isDictation ? settings.dictationSourceLang : settings.sourceLang,
     targetLang: isMeeting ? settings.meetingTargetLang : settings.targetLang,
     sttModel: isMeeting ? settings.meetingSttModel : isDictation ? settings.dictationSttModel : settings.sttModel,
-    translateModel: isMeeting ? settings.meetingTranslateModel : settings.translateModel,
+    translateModel: isMeeting ? settings.meetingTranslateModel : isDictation ? settings.translateModel : subtitleTranslateModel,
     chunkMs: isDictation ? settings.dictationChunkMs : settings.subtitleChunkMs,
     partialStableMs: isMeeting ? settings.meetingPartialStableMs : isDictation ? settings.dictationEndpointMs : settings.subtitlePartialStableMs,
     beamSize: settings.beamSize,
@@ -971,6 +1009,7 @@ function buildSessionConfig(settings: AppSettings, mode: SessionMode): CaptionCo
     dictationProperNounCorrectionEnabled: isDictation ? settings.dictationProperNounCorrectionEnabled : undefined,
     dictationPersonalGlossary: isDictation ? settings.dictationPersonalGlossary : undefined,
     dictationCloudApiKey: isDictation ? settings.dictationCloudApiKey : undefined,
+    geminiApiKey: settings.geminiApiKey,
     dictationCloudModel: isDictation ? settings.dictationCloudModel : undefined,
     dictationCloudLlmPrompt: isDictation ? settings.dictationCloudLlmPrompt : undefined,
     dictationMaxRewriteExpansionRatio: isDictation ? settings.dictationMaxRewriteExpansionRatio : undefined,
@@ -979,6 +1018,8 @@ function buildSessionConfig(settings: AppSettings, mode: SessionMode): CaptionCo
     dictationLocalLlmPrompt: isDictation ? settings.dictationLocalLlmPrompt : undefined,
     meetingSourceMode: isMeeting ? settings.meetingSourceMode : undefined,
     meetingSpeakerLabelsEnabled: isMeeting ? settings.meetingSpeakerLabelsEnabled : undefined,
+    meetingMicrophoneLabel: isMeeting ? settings.meetingMicrophoneLabel : undefined,
+    meetingSystemLabel: isMeeting ? settings.meetingSystemLabel : undefined,
     meetingNotesPrompt: isMeeting ? settings.meetingNotesPrompt : undefined,
     meetingSaveTranscript: isMeeting ? settings.meetingSaveTranscript : undefined,
     meetingTranscriptDirectory: isMeeting ? settings.meetingTranscriptDirectory : undefined,
@@ -1136,6 +1177,11 @@ function runSessionTransition(task: () => Promise<void>) {
 
 async function startDictationFromHotkey() {
   traceMainVerbose(`startDictationFromHotkey enter pressed=${String(dictationHotkeyPressed)} activeMode=${activeSessionMode ?? 'none'} pendingStop=${String(pendingDictationStop)} transition=${String(Boolean(sessionTransitionPromise))}`);
+  pendingDictationPasteTarget = await getFrontmostFocusSnapshotWithRetry();
+  traceMainVerbose(
+    `startDictationFromHotkey captured paste target app=${pendingDictationPasteTarget?.appName ?? 'none'} `
+    + `window=${pendingDictationPasteTarget?.windowTitle ?? 'none'}`,
+  );
   showDictationOverlay();
   await runSessionTransition(async () => {
     if (activeSessionMode) {
@@ -1144,7 +1190,6 @@ async function startDictationFromHotkey() {
     }
     const settings = loadSettings();
     const config = buildSessionConfig(settings, 'dictation');
-    pendingDictationPasteTarget = null;
     pendingDictationCancel = false;
     await prepareSession(config);
     traceMainVerbose(`startDictationFromHotkey startSession session=${config.sessionId}`);
@@ -1461,7 +1506,6 @@ function createTray() {
   traceMain(`createTray iconPath=${trayIconPath} file=${describeNativeImage(fileImage)} tray=${describeNativeImage(trayImage)}`);
   try {
     tray = new Tray(trayImage);
-    tray.setTitle(process.platform === 'darwin' && !isPackaged ? 'Bi' : '');
     tray.setToolTip('BiCaption');
     tray.on('click', () => showSettingsWindow());
     rebuildTrayMenu();
@@ -1580,10 +1624,16 @@ function bindBridge() {
   });
   bridge.on('error', (event: SidecarEvent) => {
     let nextEvent = event;
-    if (isRecoverableGroqWhisperQuotaError(event) && fallbackDictationSttToAppleStt()) {
+    if (isRecoverableGroqWhisperQuotaError(event) && fallbackDictationSttToAppleStt('groq-whisper')) {
       nextEvent = {
         ...event,
         message: 'Groq Whisper 額度已用完，已自動切換為 SFSpeechRecognizer。',
+      };
+    }
+    if (isRecoverableBreezeAsrError(event) && fallbackDictationSttToAppleStt('breeze-asr-25')) {
+      nextEvent = {
+        ...event,
+        message: 'Breeze ASR 無法完成本次辨識，已切回 SFSpeechRecognizer；請再說一次。',
       };
     }
     if (event.type === 'error' && event.mode === 'subtitle' && !event.recoverable) {
@@ -1753,12 +1803,10 @@ function forwardHotkeyEvent(event: DictationHotkeyEvent) {
         if (!dictationHotkeyPressed) {
           return;
         }
-        showDictationOverlay();
         void startDictationFromHotkey();
       }, 160);
       return;
     }
-    showDictationOverlay();
     void startDictationFromHotkey();
   } else if (event.type === 'hotkey_up') {
     clearDictationModifierOnlyStartTimeout();
@@ -1966,12 +2014,12 @@ function runAppleSttHelperAppForScreenCapture(action: '--check-screen-capture' |
 
   const outputPath = join(app.getPath('temp'), `bicaption-screen-capture-${process.pid}-${Date.now()}.json`);
   const errorPath = join(app.getPath('temp'), `bicaption-screen-capture-${process.pid}-${Date.now()}.err`);
+  const openArgs = action === '--request-screen-capture'
+    ? ['-n', '-a', helperAppPath]
+    : ['-n', '-g', '-a', helperAppPath];
   try {
     execFileSync('/usr/bin/open', [
-      '-n',
-      '-g',
-      '-a',
-      helperAppPath,
+      ...openArgs,
       '--stdout',
       outputPath,
       '--stderr',

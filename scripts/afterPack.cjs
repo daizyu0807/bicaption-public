@@ -36,6 +36,8 @@ module.exports = async function afterPack(context) {
   const sidecarBinary = path.join(appPath, 'Contents', 'Resources', 'sidecar', 'bicaption-sidecar');
   const appleSttHelperApp = path.join(appPath, 'Contents', 'Resources', 'AppleSTTHelper.app');
   const appleSttHelperBinary = path.join(appleSttHelperApp, 'Contents', 'MacOS', 'apple-stt');
+  const globalHotkeyHelperApp = path.join(appPath, 'Contents', 'Resources', 'GlobalHotkeyHelper.app');
+  const globalHotkeyHelperBinary = path.join(globalHotkeyHelperApp, 'Contents', 'MacOS', 'global-hotkey');
   const helperResourcesDir = path.join(appleSttHelperApp, 'Contents', 'Resources');
   const appIconSource = path.join(__dirname, '..', 'build', 'icon.icns');
   if (fs.existsSync(sidecarBinary)) {
@@ -70,6 +72,21 @@ module.exports = async function afterPack(context) {
     );
   } else {
     console.warn(`[afterPack] AppleSTTHelper binary not found: ${appleSttHelperBinary}`);
+  }
+
+  if (fs.existsSync(globalHotkeyHelperBinary)) {
+    const helperBundleId = `${bundleId}.global-hotkey-helper`;
+    console.log(`[afterPack] Signing GlobalHotkeyHelper with identifier=${helperBundleId}`);
+    execSync(
+      `codesign --force --sign - --identifier "${helperBundleId}" "${globalHotkeyHelperBinary}"`,
+      { stdio: 'inherit' },
+    );
+    execSync(
+      `codesign --force --sign - --identifier "${helperBundleId}" "${globalHotkeyHelperApp}"`,
+      { stdio: 'inherit' },
+    );
+  } else {
+    console.warn(`[afterPack] GlobalHotkeyHelper binary not found: ${globalHotkeyHelperBinary}`);
   }
 
   // Sign Frameworks and helpers

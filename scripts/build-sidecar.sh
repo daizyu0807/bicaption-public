@@ -6,13 +6,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR/.."
 PYTHON_DIR="$PROJECT_ROOT/python"
-VENV_PYTHON="$PROJECT_ROOT/.venv/bin/python"
+VENV_PYTHON="${BICAPTION_SIDECAR_PYTHON:-$PROJECT_ROOT/.venv/bin/python}"
 source "$SCRIPT_DIR/sidecar-packaging-config.sh"
 
 if [ ! -f "$VENV_PYTHON" ]; then
   echo "[build-sidecar] ERROR: .venv not found. Run: python3 -m venv .venv && source .venv/bin/activate && pip install -r python/requirements.txt"
   exit 1
 fi
+
+VENV_SITE_DIR=$("$VENV_PYTHON" -c 'import site; print(site.getsitepackages()[0])')
 
 # Ensure PyInstaller is installed
 "$VENV_PYTHON" -c "import PyInstaller" 2>/dev/null || {
@@ -49,6 +51,7 @@ LOCAL_LLM_EXCLUDES=()
 LOCAL_LLM_REWRITE_FLAG=""
 MLX_FLAGS=()
 MLX_LM_FLAGS=()
+BREEZE_ASR_FLAGS=()
 
 if bicaption_include_local_llm; then
   LOCAL_LLM_HIDDEN_IMPORTS=(
@@ -57,7 +60,7 @@ if bicaption_include_local_llm; then
     --hidden-import mlx_lm
   )
 
-  MLX_LM_DIR="$PROJECT_ROOT/.venv/lib/python3.12/site-packages/mlx_lm"
+  MLX_LM_DIR="$VENV_SITE_DIR/mlx_lm"
   if [ -d "$MLX_LM_DIR" ]; then
     MLX_LM_FLAGS+=("--add-data=$MLX_LM_DIR:mlx_lm")
     echo "[build-sidecar] Including optional mlx_lm package"
@@ -65,15 +68,41 @@ if bicaption_include_local_llm; then
     echo "[build-sidecar] WARNING: mlx_lm package directory not found, local LLM rewrite won't work in packaged build"
   fi
 
+  LOCAL_LLM_REWRITE="$PYTHON_DIR/local-llm-rewrite.py"
+  if [ -f "$LOCAL_LLM_REWRITE" ]; then
+    LOCAL_LLM_REWRITE_FLAG="--add-data=$LOCAL_LLM_REWRITE:."
+    echo "[build-sidecar] Including optional local-llm-rewrite.py"
+  else
+    echo "[build-sidecar] WARNING: local-llm-rewrite.py not found, local LLM rewrite won't work in packaged build"
+  fi
+else
+  LOCAL_LLM_EXCLUDES=(
+    --exclude-module torch
+    --exclude-module transformers
+    --exclude-module mlx_lm
+  )
+  # mlx-whisper imports timing helpers at module load.  Breeze packages need
+  # scipy, numba, and llvmlite even when word timestamps are disabled.
+  if ! bicaption_include_breeze_asr; then
+    LOCAL_LLM_EXCLUDES+=(
+      --exclude-module scipy
+      --exclude-module numba
+      --exclude-module llvmlite
+    )
+  fi
+  echo "[build-sidecar] Optional local LLM runtime is not bundled. Set BICAPTION_INCLUDE_LOCAL_LLM=1 to include it."
+fi
+
+if bicaption_include_local_llm || bicaption_include_breeze_asr; then
   # Avoid `--collect-all mlx`: PyInstaller's isolated import path can trigger
   # Metal device initialization and crash on some macOS setups during build.
   # Package the required MLX runtime files explicitly instead.
-  MLX_SITE_DIR="$PROJECT_ROOT/.venv/lib/python3.12/site-packages/mlx"
+  MLX_SITE_DIR="$VENV_SITE_DIR/mlx"
   if [ -d "$MLX_SITE_DIR" ]; then
     MLX_FLAGS+=("--add-data=$MLX_SITE_DIR:mlx")
 
     for candidate in \
-      "$PROJECT_ROOT/.venv/lib/python3.12/site-packages/libmlx.dylib" \
+      "$VENV_SITE_DIR/libmlx.dylib" \
       "$MLX_SITE_DIR/core.cpython-312-darwin.so" \
       "$MLX_SITE_DIR/lib/libmlx.dylib" \
       "$MLX_SITE_DIR/lib/mlx.metallib"
@@ -81,7 +110,7 @@ if bicaption_include_local_llm; then
       if [ -f "$candidate" ]; then
         rel_dir=$(python3 - <<PY
 import os
-site_dir = os.path.abspath("$PROJECT_ROOT/.venv/lib/python3.12/site-packages")
+site_dir = os.path.abspath("$VENV_SITE_DIR")
 candidate = os.path.abspath("$candidate")
 print(os.path.dirname(os.path.relpath(candidate, site_dir)))
 PY
@@ -95,25 +124,18 @@ PY
   else
     echo "[build-sidecar] WARNING: mlx package directory not found, MLX runtime won't work in packaged build"
   fi
-
-  LOCAL_LLM_REWRITE="$PYTHON_DIR/local-llm-rewrite.py"
-  if [ -f "$LOCAL_LLM_REWRITE" ]; then
-    LOCAL_LLM_REWRITE_FLAG="--add-data=$LOCAL_LLM_REWRITE:."
-    echo "[build-sidecar] Including optional local-llm-rewrite.py"
-  else
-    echo "[build-sidecar] WARNING: local-llm-rewrite.py not found, local LLM rewrite won't work in packaged build"
-  fi
 else
-  LOCAL_LLM_EXCLUDES=(
-    --exclude-module torch
-    --exclude-module scipy
-    --exclude-module numba
-    --exclude-module llvmlite
-    --exclude-module transformers
-    --exclude-module mlx
-    --exclude-module mlx_lm
+  LOCAL_LLM_EXCLUDES+=(--exclude-module mlx --exclude-module mlx_whisper)
+fi
+
+if bicaption_include_breeze_asr; then
+  BREEZE_ASR_FLAGS=(
+    --hidden-import mlx_whisper
+    --collect-all mlx_whisper
   )
-  echo "[build-sidecar] Optional local LLM runtime is not bundled. Set BICAPTION_INCLUDE_LOCAL_LLM=1 to include it."
+  echo "[build-sidecar] Including opt-in Breeze ASR 25 runtime"
+else
+  BREEZE_ASR_FLAGS=(--exclude-module mlx_whisper)
 fi
 
 # Ensure apple-stt binary exists
@@ -168,6 +190,7 @@ set +u
   "${LOCAL_LLM_EXCLUDES[@]}" \
   "${MLX_FLAGS[@]}" \
   "${MLX_LM_FLAGS[@]}" \
+  "${BREEZE_ASR_FLAGS[@]}" \
   $SHERPA_COLLECT \
   $SHERPA_NATIVE \
   $APPLE_STT_FLAG \
@@ -178,6 +201,27 @@ set -u
 
 BINARY="$PYTHON_DIR/dist/bicaption-sidecar/bicaption-sidecar"
 if [ -f "$BINARY" ]; then
+  # MLX wheels may contain precompiled caches whose code-object filenames
+  # expose the build machine's absolute path. Source modules remain bundled,
+  # so remove only those generated caches before packaging the public app.
+  MLX_BUNDLE_ROOT="$PYTHON_DIR/dist/bicaption-sidecar/_internal/mlx"
+  if [ -d "$MLX_BUNDLE_ROOT" ]; then
+    "$VENV_PYTHON" - "$MLX_BUNDLE_ROOT" <<'PY'
+from pathlib import Path
+import shutil
+import sys
+
+root = Path(sys.argv[1]).resolve()
+for cache_dir in sorted(root.rglob("__pycache__"), reverse=True):
+    shutil.rmtree(cache_dir)
+PY
+  fi
+
+  if bicaption_include_breeze_asr; then
+    touch "$PYTHON_DIR/dist/bicaption-sidecar/breeze-asr-runtime.enabled"
+  else
+    rm -f "$PYTHON_DIR/dist/bicaption-sidecar/breeze-asr-runtime.enabled"
+  fi
   echo "[build-sidecar] Success: $BINARY"
   du -sh "$PYTHON_DIR/dist/bicaption-sidecar/"
 else

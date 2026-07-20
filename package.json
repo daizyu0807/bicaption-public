@@ -1,6 +1,6 @@
 {
   "name": "bicaption",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Realtime bilingual caption overlay for macOS — local STT with SenseVoice + Google Translate",
   "license": "MIT",
   "author": "davedai",
@@ -10,7 +10,7 @@
   },
   "type": "module",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.12.0"
   },
   "main": "dist/electron/main.js",
   "scripts": {
@@ -18,12 +18,13 @@
     "build": "npm run build:electron && npm run build:renderer",
     "build:electron": "tsc -p tsconfig.electron.json",
     "build:renderer": "node scripts/run-vite.mjs build",
-    "build:apple-stt": "bash scripts/build-apple-stt.sh",
     "build:global-hotkey": "bash scripts/build-global-hotkey.sh",
     "build:sidecar": "bash scripts/build-sidecar.sh",
     "build:sidecar:full": "BICAPTION_INCLUDE_LOCAL_LLM=1 bash scripts/build-sidecar.sh",
-    "dist": "npm run build && npm run build:global-hotkey && npm run build:apple-stt && npm run build:sidecar && electron-builder --mac && npm run verify:app",
-    "dist:unsigned": "npm run build && npm run build:global-hotkey && npm run build:apple-stt && npm run build:sidecar && electron-builder --mac --config.mac.identity=null",
+    "build:sidecar:breeze-asr": "BICAPTION_INCLUDE_BREEZE_ASR=1 bash scripts/build-sidecar.sh",
+    "dist": "npm run build && npm run build:global-hotkey && npm run build:sidecar:breeze-asr && electron-builder --mac && npm run verify:app",
+    "dist:unsigned": "npm run build && npm run build:global-hotkey && npm run build:sidecar:breeze-asr && electron-builder --mac --config.mac.identity=null",
+    "dist:breeze-asr": "npm run build && npm run build:global-hotkey && npm run build:sidecar:breeze-asr && electron-builder --mac && npm run verify:app",
     "install:local-app": "bash scripts/install-local-app.sh",
     "verify:app": "bash scripts/verify-app-artifact.sh",
     "type-check": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.electron.json",
@@ -49,11 +50,11 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^5.1.0",
-    "electron": "^37.2.0",
+    "electron": "^43.1.1",
     "electron-builder": "^26.8.1",
-    "tsx": "^4.20.3",
+    "tsx": "^4.23.1",
     "typescript": "^5.9.2",
-    "vite": "^7.1.3"
+    "vite": "^7.3.5"
   },
   "build": {
     "appId": "com.davedai.bicaption",
@@ -90,6 +91,10 @@
       {
         "from": "AppleSTTHelper.app",
         "to": "AppleSTTHelper.app"
+      },
+      {
+        "from": "GlobalHotkeyHelper.app",
+        "to": "GlobalHotkeyHelper.app"
       }
     ],
     "afterPack": "scripts/afterPack.cjs",

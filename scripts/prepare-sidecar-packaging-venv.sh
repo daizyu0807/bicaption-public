@@ -9,6 +9,7 @@ VENV_DIR="$PROJECT_ROOT/.venv-sidecar"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 WITH_MLX_WHISPER=0
 WITH_LOCAL_LLM=0
+WITH_BREEZE_ASR=0
 WITH_BUILD_TOOL=0
 DRY_RUN=0
 RUN_PROBES=1
@@ -24,6 +25,7 @@ Options:
   --with-legacy-mlx-whisper
                         Deprecated no-op; MLX Whisper is no longer packaged
   --with-local-llm      Install the optional local LLM tier
+  --with-breeze-asr     Install the opt-in Breeze ASR 25 runtime tier
   --with-build-tool     Install PyInstaller into the packaging venv
   --no-probes           Skip read-only import probes after install
   --dry-run             Print planned commands without running them
@@ -56,6 +58,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --with-local-llm)
       WITH_LOCAL_LLM=1
+      shift
+      ;;
+    --with-breeze-asr)
+      WITH_BREEZE_ASR=1
       shift
       ;;
     --with-build-tool)
@@ -97,6 +103,10 @@ fi
 
 if (( WITH_LOCAL_LLM )); then
   REQS+=("$PROJECT_ROOT/python/requirements-sidecar-local-llm.txt")
+fi
+
+if (( WITH_BREEZE_ASR )); then
+  REQS+=("$PROJECT_ROOT/python/requirements-sidecar-breeze-asr.txt")
 fi
 
 for req in "${REQS[@]}"; do
@@ -150,9 +160,9 @@ if (( WITH_BUILD_TOOL )); then
 fi
 
 if (( RUN_PROBES )); then
-  if (( WITH_LOCAL_LLM )); then
-    run env BICAPTION_INCLUDE_LOCAL_LLM=1 BICAPTION_SIDECAR_PYTHON="$VENV_PYTHON" bash "$PROJECT_ROOT/scripts/verify-torch-free-import.sh"
-    run env BICAPTION_INCLUDE_LOCAL_LLM=1 BICAPTION_SIDECAR_PYTHON="$VENV_PYTHON" bash "$PROJECT_ROOT/scripts/analyze-sidecar-deps.sh"
+  if (( WITH_LOCAL_LLM || WITH_BREEZE_ASR )); then
+    run env BICAPTION_INCLUDE_LOCAL_LLM="$WITH_LOCAL_LLM" BICAPTION_INCLUDE_BREEZE_ASR="$WITH_BREEZE_ASR" BICAPTION_SIDECAR_PYTHON="$VENV_PYTHON" bash "$PROJECT_ROOT/scripts/verify-torch-free-import.sh"
+    run env BICAPTION_INCLUDE_LOCAL_LLM="$WITH_LOCAL_LLM" BICAPTION_INCLUDE_BREEZE_ASR="$WITH_BREEZE_ASR" BICAPTION_SIDECAR_PYTHON="$VENV_PYTHON" bash "$PROJECT_ROOT/scripts/analyze-sidecar-deps.sh"
   else
     run env BICAPTION_SIDECAR_PYTHON="$VENV_PYTHON" bash "$PROJECT_ROOT/scripts/verify-torch-free-import.sh"
     run env BICAPTION_SIDECAR_PYTHON="$VENV_PYTHON" bash "$PROJECT_ROOT/scripts/analyze-sidecar-deps.sh"

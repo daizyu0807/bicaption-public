@@ -8,6 +8,7 @@ set -euo pipefail
 APP="${1:-release/mac-arm64/BiCaption.app}"
 EXPECTED_BUNDLE_ID="com.davedai.bicaption"
 EXPECTED_APPLE_STT_HELPER_ID="com.davedai.bicaption.apple-stt-helper"
+EXPECTED_GLOBAL_HOTKEY_HELPER_ID="com.davedai.bicaption.global-hotkey-helper"
 ERRORS=0
 
 pass() { printf '  \033[32m✓\033[0m %s\n' "$1"; }
@@ -101,6 +102,33 @@ else
   fail "Global hotkey helper missing: $HOTKEY"
 fi
 
+GLOBAL_HOTKEY_HELPER_APP="$APP/Contents/Resources/GlobalHotkeyHelper.app"
+GLOBAL_HOTKEY_HELPER_BIN="$GLOBAL_HOTKEY_HELPER_APP/Contents/MacOS/global-hotkey"
+if [ -x "$GLOBAL_HOTKEY_HELPER_BIN" ]; then
+  pass "Global hotkey helper app executable"
+  if codesign -v "$GLOBAL_HOTKEY_HELPER_APP" 2>/dev/null; then
+    pass "Global hotkey helper app code signature valid"
+    GLOBAL_HOTKEY_SIGN_ID=$(codesign -d --verbose=2 "$GLOBAL_HOTKEY_HELPER_APP" 2>&1 | grep "Identifier=" | head -1 | cut -d= -f2- || echo "")
+    if [ "$GLOBAL_HOTKEY_SIGN_ID" = "$EXPECTED_GLOBAL_HOTKEY_HELPER_ID" ]; then
+      pass "Global hotkey helper identifier: $GLOBAL_HOTKEY_SIGN_ID"
+    else
+      fail "Global hotkey helper identifier mismatch: got '$GLOBAL_HOTKEY_SIGN_ID', expected '$EXPECTED_GLOBAL_HOTKEY_HELPER_ID'"
+    fi
+  else
+    fail "Global hotkey helper app code signature INVALID"
+  fi
+else
+  fail "Global hotkey helper app missing or not executable: $GLOBAL_HOTKEY_HELPER_BIN"
+fi
+
+GLOBAL_HOTKEY_BUNDLE_NAME=$(plutil -extract CFBundleName raw "$GLOBAL_HOTKEY_HELPER_APP/Contents/Info.plist" 2>/dev/null || echo "")
+GLOBAL_HOTKEY_DISPLAY_NAME=$(plutil -extract CFBundleDisplayName raw "$GLOBAL_HOTKEY_HELPER_APP/Contents/Info.plist" 2>/dev/null || echo "")
+if [ "$GLOBAL_HOTKEY_BUNDLE_NAME" = "BiCaption" ] && [ "$GLOBAL_HOTKEY_DISPLAY_NAME" = "BiCaption" ]; then
+  pass "Global hotkey helper displays as BiCaption in system permission UI"
+else
+  fail "Global hotkey helper display name mismatch: CFBundleName='$GLOBAL_HOTKEY_BUNDLE_NAME', CFBundleDisplayName='$GLOBAL_HOTKEY_DISPLAY_NAME'"
+fi
+
 # ── 10. App resources (asar or unpacked) ──
 ASAR="$APP/Contents/Resources/app.asar"
 APP_DIR="$APP/Contents/Resources/app"
@@ -143,6 +171,14 @@ if [ "$HELPER_ICON_FILE" = "icon.icns" ]; then
   pass "Apple STT helper icon declaration"
 else
   fail "Apple STT helper icon declaration missing"
+fi
+
+HELPER_BUNDLE_NAME=$(plutil -extract CFBundleName raw "$APPLE_STT_HELPER_APP/Contents/Info.plist" 2>/dev/null || echo "")
+HELPER_DISPLAY_NAME=$(plutil -extract CFBundleDisplayName raw "$APPLE_STT_HELPER_APP/Contents/Info.plist" 2>/dev/null || echo "")
+if [ "$HELPER_BUNDLE_NAME" = "BiCaption" ] && [ "$HELPER_DISPLAY_NAME" = "BiCaption" ]; then
+  pass "Apple STT helper displays as BiCaption in system permission UI"
+else
+  fail "Apple STT helper display name mismatch: CFBundleName='$HELPER_BUNDLE_NAME', CFBundleDisplayName='$HELPER_DISPLAY_NAME'"
 fi
 
 if [ -f "$APPLE_STT_HELPER_ICON" ]; then

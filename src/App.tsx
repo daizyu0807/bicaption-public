@@ -1,4 +1,4 @@
-import { startTransition, useCallback, useEffect, useRef, useState } from 'react';
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   AppSettings,
   CaptionConfig,
@@ -17,6 +17,13 @@ import { pickPreferredInputDevice } from './device-preferences.js';
 import { getDictationHotkeyLabel, isModifierOnlyHotkey, validateDictationHotkey } from './dictation-hotkey.js';
 import { initialMeetingViewState, reduceMeetingEvent } from './meeting-state.js';
 import { buildMeetingTurns } from './meeting-turns.js';
+import {
+  getDefaultSubtitleTargetLang,
+  isTranslationEnabled,
+  resolveSttModelForSourceLang,
+  resolveTargetLangForSourceLang,
+  sttModelSupportsAutoDetect,
+} from './session-settings-logic.js';
 
 const GROQ_MODEL_OPTIONS = [
   { value: 'auto', label: '自動選擇（推薦）' },
@@ -438,37 +445,18 @@ function getDictationPrompt(
   return null;
 }
 
-function isTranslationEnabled(settings: AppSettings): boolean {
-  if (settings.translateModel === 'disabled') return false;
-  return settings.sourceLang === 'auto' || settings.targetLang !== settings.sourceLang;
-}
-
 function isMeetingTranslationEnabled(settings: AppSettings): boolean {
   return settings.meetingTranslateModel !== 'disabled';
-}
-
-function getDefaultSubtitleTargetLang(sourceLang: string): string {
-  if (sourceLang === 'en') return 'zh-TW';
-  if (sourceLang === 'ja') return 'zh-TW';
-  if (sourceLang === 'ko') return 'zh-TW';
-  if (sourceLang === 'zh-TW') return 'en';
-  return 'zh-TW';
-}
-
-function getRecommendedSubtitleSttModel(sourceLang: string, currentModel?: string): string {
-  if (currentModel === 'groq-whisper') {
-    return currentModel;
-  }
-  return sourceLang === 'auto' ? 'sensevoice' : 'apple-stt';
-}
-
-function getRecommendedDictationSttModel(sourceLang: string): string {
-  return sourceLang === 'auto' ? 'groq-whisper' : 'apple-stt';
 }
 
 function buildSessionConfig(settings: AppSettings, mode: SessionMode = 'subtitle'): CaptionConfig {
   const isDictation = mode === 'dictation';
   const isMeeting = mode === 'meeting';
+  const subtitleTranslateModel = settings.sttModel === 'gemini-live'
+    ? 'gemini-live'
+    : settings.translateModel === 'gemini-live'
+      ? 'google'
+      : settings.translateModel;
   const meetingPrimaryDeviceId = settings.meetingSourceMode === 'system-audio'
     ? settings.meetingSystemAudioDeviceId
     : settings.meetingMicDeviceId;
@@ -483,7 +471,7 @@ function buildSessionConfig(settings: AppSettings, mode: SessionMode = 'subtitle
     sourceLang: isMeeting ? settings.meetingSourceLang : isDictation ? settings.dictationSourceLang : settings.sourceLang,
     targetLang: isMeeting ? settings.meetingTargetLang : settings.targetLang,
     sttModel: isMeeting ? settings.meetingSttModel : isDictation ? settings.dictationSttModel : settings.sttModel,
-    translateModel: isMeeting ? settings.meetingTranslateModel : settings.translateModel,
+    translateModel: isMeeting ? settings.meetingTranslateModel : isDictation ? settings.translateModel : subtitleTranslateModel,
     chunkMs: isDictation ? settings.dictationChunkMs : settings.subtitleChunkMs,
     partialStableMs: isMeeting ? settings.meetingPartialStableMs : isDictation ? settings.dictationEndpointMs : settings.subtitlePartialStableMs,
     beamSize: settings.beamSize,
@@ -498,6 +486,7 @@ function buildSessionConfig(settings: AppSettings, mode: SessionMode = 'subtitle
     dictationProperNounCorrectionEnabled: isDictation ? false : undefined,
     dictationPersonalGlossary: undefined,
     dictationCloudApiKey: settings.dictationCloudApiKey,
+    geminiApiKey: settings.geminiApiKey,
     dictationCloudModel: settings.dictationCloudModel,
     dictationCloudLlmPrompt: isDictation ? settings.dictationCloudLlmPrompt : undefined,
     dictationMaxRewriteExpansionRatio: isDictation ? settings.dictationMaxRewriteExpansionRatio : undefined,
@@ -506,6 +495,8 @@ function buildSessionConfig(settings: AppSettings, mode: SessionMode = 'subtitle
     dictationLocalLlmPrompt: isDictation ? settings.dictationLocalLlmPrompt : undefined,
     meetingSourceMode: isMeeting ? settings.meetingSourceMode : undefined,
     meetingSpeakerLabelsEnabled: isMeeting ? settings.meetingSpeakerLabelsEnabled : undefined,
+    meetingMicrophoneLabel: isMeeting ? settings.meetingMicrophoneLabel : undefined,
+    meetingSystemLabel: isMeeting ? settings.meetingSystemLabel : undefined,
     meetingNotesPrompt: isMeeting ? settings.meetingNotesPrompt : undefined,
     meetingSaveTranscript: isMeeting ? settings.meetingSaveTranscript : undefined,
     meetingTranscriptDirectory: isMeeting ? settings.meetingTranscriptDirectory : undefined,
@@ -550,7 +541,7 @@ function getDictationPermissionSummary(
     : '';
   return {
     label: '未授權',
-    detail: `請允許 ${missing.join('、')}。完成授權後請重開 BiCaption。${inputDetail}`,
+    detail: `請允許 ${missing.join('、')}。完成授權後切回 BiCaption，系統會重新檢查。${inputDetail}`,
     missing,
   };
 }
@@ -571,6 +562,13 @@ const MODEL_LIBRARY = [
     description: '線上高品質 STT，適合英文專名與混語 dictation 場景。',
   },
   {
+    key: 'breeze-asr-25',
+    label: 'Breeze ASR 25 精準辨識',
+    sizeLabel: '~3.1 GB',
+    format: 'MLX / batch',
+    description: '台灣中文與中英混說的本地精準辨識；聽寫放鍵或會議偵測到停頓後才產生完整文字。',
+  },
+  {
     key: 'vad',
     label: 'Silero VAD',
     sizeLabel: '~2 MB',
@@ -580,13 +578,15 @@ const MODEL_LIBRARY = [
 ] as const;
 
 const ASR_MODEL_OPTIONS = [
+  { key: 'gemini-live', label: 'Gemini 3.5 Live Translate', note: '雲端即時 STT + 翻譯' },
   { key: 'groq-whisper', label: 'Groq Whisper', note: '線上高準確 / 需網路' },
+  { key: 'breeze-asr-25', label: 'Breeze ASR 25 精準辨識', note: '本地分段 / 台灣中文與混語' },
   { key: 'apple-stt', label: 'SFSpeechRecognizer', note: '本地快速' },
   { key: 'sensevoice', label: 'SenseVoice', note: '本地多語' },
 ] as const;
 
 const SUBTITLE_ASR_MODEL_OPTIONS = ASR_MODEL_OPTIONS.filter((option) =>
-  option.key === 'apple-stt' || option.key === 'sensevoice');
+  option.key === 'apple-stt' || option.key === 'sensevoice' || option.key === 'gemini-live');
 
 type AppGlyphName =
   | 'subtitle'
@@ -755,6 +755,12 @@ function getAsrOptionsForMode(mode: SessionMode) {
 }
 
 function isAsrModelUnavailableInMode(modelKey: string, mode: SessionMode) {
+  if (modelKey === 'gemini-live') {
+    return mode !== 'subtitle' && mode !== 'meeting';
+  }
+  if (modelKey === 'breeze-asr-25') {
+    return mode === 'subtitle';
+  }
   return (modelKey === 'whisper-mlx' || modelKey === 'groq-whisper') && mode !== 'dictation';
 }
 
@@ -764,6 +770,8 @@ function isModelReady(status: ModelStatus | null, key: (typeof MODEL_LIBRARY)[nu
       return true;
     case 'sensevoice':
       return status?.sensevoice ?? false;
+    case 'breeze-asr-25':
+      return status?.breezeAsr ?? false;
     case 'vad':
       return status?.vad ?? false;
     default:
@@ -784,7 +792,9 @@ function getDictationOutputActionLabel(action: DictationOutputAction) {
 
 function isSessionModelReady(status: ModelStatus | null, modelKey: string) {
   const modelReadyMap: Record<string, boolean> = {
+    'gemini-live': true,
     'groq-whisper': true,
+    'breeze-asr-25': status?.breezeAsr ?? false,
     sensevoice: status?.sensevoice ?? false,
     'apple-stt': true,
   };
@@ -913,6 +923,7 @@ function SettingsView({
   const [hotkeyTestError, setHotkeyTestError] = useState<string | null>(null);
   const [subtitleActionError, setSubtitleActionError] = useState<string | null>(null);
   const [dictationPermissionReadyToRestart, setDictationPermissionReadyToRestart] = useState(false);
+  const dictationPermissionFlowActiveRef = useRef(false);
   const [meetingCopilotInsights, setMeetingCopilotInsights] = useState<MeetingCopilotInsightsResult | null>(null);
   const [meetingCopilotError, setMeetingCopilotError] = useState<string | null>(null);
   const [isMeetingCopilotLoading, setIsMeetingCopilotLoading] = useState(false);
@@ -924,6 +935,8 @@ function SettingsView({
   const hotkeyBinding: DictationHotkeyBinding = draft.dictationHotkey;
   const hotkeyValidation = validateDictationHotkey(hotkeyBinding);
   const dictationPermissionSummary = getDictationPermissionSummary(accessibilityPermission, inputMonitoringPermission);
+  const accessibilityPermissionGranted = accessibilityPermission?.trusted === true;
+  const inputMonitoringPermissionGranted = inputMonitoringPermission?.trusted === true;
   const needsDictationPermission = dictationPermissionSummary.missing.length > 0 || !accessibilityPermission || !inputMonitoringPermission;
   const showDictationPermissionCard = needsDictationPermission || dictationPermissionReadyToRestart;
   const cloudLlmEnabled = draft.dictationRewriteMode === 'rules-and-cloud';
@@ -940,14 +953,41 @@ function SettingsView({
   const subtitleModelEntries = MODEL_LIBRARY.map((entry) => ({
     ...entry,
     ready: isModelReady(localModelStatus, entry.key),
+    runtimeAvailable: entry.key !== 'breeze-asr-25' || Boolean(localModelStatus?.breezeAsrRuntime),
   }));
-  const subtitleAsrOptions = SUBTITLE_ASR_MODEL_OPTIONS.map((option) => ({
-    ...option,
-    disabled: false,
-  }));
-  const dictationAsrOptions = getAsrOptionsForMode('dictation');
-  const meetingAsrOptions = getAsrOptionsForMode('meeting');
-  const meetingTurns = buildMeetingTurns(meetingViewState.entries);
+  const subtitleAsrOptions = SUBTITLE_ASR_MODEL_OPTIONS.map((option) => {
+    const disabled = draft.sourceLang === 'auto' && !sttModelSupportsAutoDetect(option.key);
+    return {
+      ...option,
+      disabled,
+      note: disabled ? `${option.note} / 不支援自動偵測` : option.note,
+    };
+  });
+  const dictationAsrOptions = getAsrOptionsForMode('dictation').map((option) => {
+    const disabled = option.disabled || (option.key === 'breeze-asr-25' && !localModelStatus?.breezeAsr);
+    return {
+      ...option,
+      disabled,
+      note: disabled && option.key === 'breeze-asr-25'
+        ? '需先下載模型，且 App 必須含 Breeze runtime'
+        : option.note,
+    };
+  });
+  const meetingAsrOptions = getAsrOptionsForMode('meeting').map((option) => {
+    const disabled = option.disabled
+      || (option.key === 'breeze-asr-25' && !localModelStatus?.breezeAsr)
+      || (draft.meetingSourceLang === 'auto' && !sttModelSupportsAutoDetect(option.key));
+    return {
+      ...option,
+      disabled,
+      note: disabled && option.key === 'breeze-asr-25'
+        ? '需先下載模型，且 App 必須含 Breeze runtime'
+        : disabled && !option.disabled
+          ? `${option.note} / 不支援自動偵測`
+          : option.note,
+    };
+  });
+  const meetingTurns = useMemo(() => buildMeetingTurns(meetingViewState.entries), [meetingViewState.entries]);
   const isMeetingStreaming = meetingViewState.sessionState === 'streaming' || meetingViewState.sessionState === 'connecting';
   const hasMeetingTranscript = meetingViewState.entries.length > 0 || Boolean(meetingViewState.partial);
   const meetingTranscriptRef = useRef<HTMLDivElement | null>(null);
@@ -1147,9 +1187,27 @@ function SettingsView({
     return { accessibility, inputMonitoring };
   }
 
+  useEffect(() => {
+    function refreshWhenActive() {
+      if (document.visibilityState !== 'hidden') {
+        refreshDictationPermissions({
+          markRestartWhenGranted: dictationPermissionFlowActiveRef.current,
+        }).catch(() => {});
+      }
+    }
+
+    window.addEventListener('focus', refreshWhenActive);
+    document.addEventListener('visibilitychange', refreshWhenActive);
+    return () => {
+      window.removeEventListener('focus', refreshWhenActive);
+      document.removeEventListener('visibilitychange', refreshWhenActive);
+    };
+  }, []);
+
   async function requestDictationPermissions() {
     setHotkeyTestError(null);
     setDictationPermissionReadyToRestart(false);
+    dictationPermissionFlowActiveRef.current = true;
     try {
       let accessibility = await window.app.checkAccessibilityPermission();
       if (!accessibility.trusted) {
@@ -1330,7 +1388,7 @@ function SettingsView({
         {activeSettingsTab === 'dictation' && (
         <div className="va-grid-panel va-grid-panel-dictation">
           <article className="va-card va-hero-card">
-            <div className="va-dictation-hero-icon" aria-hidden="true">🎙</div>
+            <div className="va-dictation-hero-icon" aria-hidden="true"><AppGlyph name="mic" size={42} /></div>
             <div className="va-hero-copy">
               <span className="va-hero-badge">Push to talk</span>
               <h3 className="va-hero-title">按住快捷鍵說話</h3>
@@ -1415,19 +1473,49 @@ function SettingsView({
               </div>
               {showDictationPermissionCard && (
                 <div className="bc-inline-permission">
-                  <div className="va-permission-row">
+                  <div className="bc-permission-header">
+                    <span className="bc-permission-shield" aria-hidden="true">✓</span>
                     <div className="bc-inline-permission-copy">
-                      <strong>語音輸入權限：{dictationPermissionReadyToRestart ? '已允許' : dictationPermissionSummary.label}</strong>
-                      <p>{dictationPermissionReadyToRestart ? '權限已允許，請重開 BiCaption 讓語音輸入快捷鍵套用最新授權。' : dictationPermissionSummary.detail}</p>
+                      <strong>完成語音輸入設定</strong>
+                      <p>依序完成兩項權限，最後只需重新開啟一次。</p>
                     </div>
-                    <div className="bc-inline-permission-actions">
-                      {needsDictationPermission ? (
-                        <button className="secondary" onClick={requestDictationPermissions}>授權</button>
-                      ) : null}
-                      {dictationPermissionReadyToRestart ? (
-                        <button className="secondary" onClick={async () => { await window.app.relaunchApp(); }}>重開 BiCaption</button>
-                      ) : null}
+                  </div>
+                  <div className="bc-permission-progress">
+                    <div className={accessibilityPermissionGranted ? 'bc-permission-step complete' : 'bc-permission-step current'}>
+                      <span className="bc-permission-step-marker" aria-hidden="true">{accessibilityPermissionGranted ? '✓' : '1'}</span>
+                      <div className="bc-permission-step-copy">
+                        <strong>輔助使用</strong>
+                        <span>允許自動貼上辨識結果</span>
+                      </div>
+                      <span className={accessibilityPermissionGranted ? 'bc-permission-status complete' : 'bc-permission-status pending'}>
+                        {accessibilityPermissionGranted ? '已允許' : '待完成'}
+                      </span>
                     </div>
+                    <div className={inputMonitoringPermissionGranted ? 'bc-permission-step complete' : accessibilityPermissionGranted ? 'bc-permission-step current' : 'bc-permission-step'}>
+                      <span className="bc-permission-step-marker" aria-hidden="true">{inputMonitoringPermissionGranted ? '✓' : '2'}</span>
+                      <div className="bc-permission-step-copy">
+                        <strong>輸入監控</strong>
+                        <span>允許全域快捷鍵在背景運作</span>
+                      </div>
+                      <span className={inputMonitoringPermissionGranted ? 'bc-permission-status complete' : 'bc-permission-status pending'}>
+                        {inputMonitoringPermissionGranted ? '已允許' : '待完成'}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="bc-inline-permission-actions">
+                    {needsDictationPermission ? (
+                      <button className="button-primary bc-permission-primary" onClick={requestDictationPermissions}>
+                        {!accessibilityPermissionGranted ? '授權輔助使用' : '授權輸入監控'}
+                      </button>
+                    ) : null}
+                    {dictationPermissionReadyToRestart ? (
+                      <button className="button-primary bc-permission-primary" onClick={async () => { await window.app.relaunchApp(); }}>
+                        完成授權並重新開啟
+                      </button>
+                    ) : null}
+                    <p className="bc-permission-footnote">
+                      {dictationPermissionReadyToRestart ? '兩項權限已完成，重新開啟後即可使用。' : '兩項皆完成後即可重新開啟 BiCaption。'}
+                    </p>
                   </div>
                 </div>
               )}
@@ -1460,7 +1548,11 @@ function SettingsView({
               <div className="va-row">
                 <div className="va-row-copy">
                   <strong>辨識引擎</strong>
-                  <p>{draft.dictationSttModel === 'groq-whisper' ? 'Groq Whisper 適合混語與專有名詞。' : 'Apple STT / 本地模型較適合快速回應。'}</p>
+                  <p>{draft.dictationSttModel === 'groq-whisper'
+                    ? 'Groq Whisper 適合混語與專有名詞。'
+                    : draft.dictationSttModel === 'breeze-asr-25'
+                      ? 'Breeze 會在放開按鍵後離線批次辨識，適合台灣中文與中英混說。'
+                      : 'Apple STT / 本地模型較適合快速回應。'}</p>
                 </div>
                 <select
                   value={draft.dictationSttModel}
@@ -1620,16 +1712,12 @@ function SettingsView({
                     </span>
                     <select value={draft.sourceLang} onChange={(event) => {
                       const lang = event.target.value;
-                      const recommended = getRecommendedSubtitleSttModel(lang, draft.sttModel);
-                      const nextDraft: AppSettings = {
+                      setDraft({
                         ...draft,
                         sourceLang: lang,
-                        sttModel: recommended,
-                      };
-                      if (isTranslationEnabled(draft) && draft.targetLang === draft.sourceLang) {
-                        nextDraft.targetLang = getDefaultSubtitleTargetLang(lang);
-                      }
-                      setDraft(nextDraft);
+                        sttModel: resolveSttModelForSourceLang(lang, draft.sttModel),
+                        targetLang: resolveTargetLangForSourceLang(lang, draft.targetLang, isTranslationEnabled(draft)),
+                      });
                     }}>
                       <option value="auto">自動偵測</option>
                       <option value="en">English</option>
@@ -1664,6 +1752,7 @@ function SettingsView({
                   <input
                     type="checkbox"
                     checked={translationOn}
+                    disabled={draft.sttModel === 'gemini-live'}
                     onChange={(event) => setDraft({
                       ...draft,
                       translateModel: event.target.checked ? 'google' : 'disabled',
@@ -1799,7 +1888,7 @@ function SettingsView({
             <article className="va-card va-card-bodyless">
               <div className="bc-card-header">
                 <h3 className="bc-card-title">辨識引擎</h3>
-                <p className="bc-card-hint">建議依來源語言自動選擇。</p>
+                <p className="bc-card-hint">依需求選擇；來源語言為自動偵測時，僅能使用支援多語的引擎。</p>
               </div>
               <div className="bc-card-body">
                 <div className="bc-simple-row">
@@ -1810,14 +1899,24 @@ function SettingsView({
                         ? 'Apple STT：本地、最快，固定語言優先。'
                         : draft.sttModel === 'sensevoice'
                           ? 'SenseVoice：本地多語，可處理混語場景。'
-                          : 'Groq Whisper：雲端高品質，需網路。'}
+                          : draft.sttModel === 'gemini-live'
+                            ? 'Gemini Live Translate：雲端即時收音、辨識並翻譯，需網路。'
+                            : 'Groq Whisper：雲端高品質，需網路。'}
                     </p>
                   </div>
                   <select
                     value={draft.sttModel}
                     onChange={(event) => {
                       const nextModel = event.target.value;
-                      setDraft({ ...draft, sttModel: nextModel });
+                      setDraft({
+                        ...draft,
+                        sttModel: nextModel,
+                        translateModel: nextModel === 'gemini-live'
+                          ? 'gemini-live'
+                          : draft.translateModel === 'gemini-live'
+                            ? 'google'
+                            : draft.translateModel,
+                      });
                     }}
                   >
                     {subtitleAsrOptions.map((option) => (
@@ -1839,6 +1938,22 @@ function SettingsView({
                       />
                     </label>
                     <p className="model-hint">Groq Whisper 會把字幕音訊送到雲端做語音辨識；翻譯仍維持你目前的翻譯引擎設定。</p>
+                  </div>
+                )}
+                {draft.sttModel === 'gemini-live' && (
+                  <div className="bc-inline-field">
+                    <label className="settings-label">
+                      <span>Gemini API Key</span>
+                      <input
+                        type="password"
+                        value={draft.geminiApiKey}
+                        onChange={(event) => setDraft({ ...draft, geminiApiKey: event.target.value })}
+                        placeholder="AIza..."
+                        autoComplete="off"
+                        spellCheck={false}
+                      />
+                    </label>
+                    <p className="model-hint">Gemini Live Translate 會把字幕音訊送到 Gemini 雲端做即時 STT 與翻譯。</p>
                   </div>
                 )}
               </div>
@@ -1899,18 +2014,24 @@ function SettingsView({
                 ) : (
                   <>
                     {meetingTurns.map((turn) => {
-                      const speakerLabel = getMeetingSpeakerLabel(draft, turn.speakerKind, turn.source, turn.speakerLabel);
+                      const speakerLabel = draft.meetingSpeakerLabelsEnabled
+                        ? getMeetingSpeakerLabel(draft, turn.speakerKind, turn.source, turn.speakerLabel)
+                        : '';
                       const isRemote = turn.source === 'system';
                       return (
                         <article key={turn.id} className="va-meeting-turn">
-                          <span className={isRemote ? 'va-meeting-avatar va-meeting-avatar-remote' : 'va-meeting-avatar va-meeting-avatar-local'}>
-                            {speakerLabel.slice(0, 1)}
-                          </span>
+                          {speakerLabel ? (
+                            <span className={isRemote ? 'va-meeting-avatar va-meeting-avatar-remote' : 'va-meeting-avatar va-meeting-avatar-local'}>
+                              {speakerLabel.slice(0, 1)}
+                            </span>
+                          ) : null}
                           <div className="va-meeting-turn-copy">
-                            <div className="va-meeting-turn-meta">
-                              <strong>{speakerLabel}</strong>
-                              <span>{formatMeetingTimestamp(turn.startedAtMs ?? turn.endedAtMs)}</span>
-                            </div>
+                            {speakerLabel ? (
+                              <div className="va-meeting-turn-meta">
+                                <strong>{speakerLabel}</strong>
+                                <span>{formatMeetingTimestamp(turn.startedAtMs ?? turn.endedAtMs)}</span>
+                              </div>
+                            ) : null}
                             <div className="va-meeting-turn-bubble">
                               <p className="va-meeting-turn-source">{turn.sourceText}</p>
                               {meetingTranslationOn && turn.translatedText ? (
@@ -1923,26 +2044,30 @@ function SettingsView({
                     })}
                     {meetingViewState.partial ? (
                       <article className="va-meeting-turn va-meeting-turn-partial">
-                        <span className={meetingViewState.partial.source === 'system' ? 'va-meeting-avatar va-meeting-avatar-remote' : 'va-meeting-avatar va-meeting-avatar-local'}>
-                          {getMeetingSpeakerLabel(
-                            draft,
-                            meetingViewState.partial.speakerKind,
-                            meetingViewState.partial.source,
-                            meetingViewState.partial.speakerLabel,
-                          ).slice(0, 1)}
-                        </span>
+                        {draft.meetingSpeakerLabelsEnabled ? (
+                          <span className={meetingViewState.partial.source === 'system' ? 'va-meeting-avatar va-meeting-avatar-remote' : 'va-meeting-avatar va-meeting-avatar-local'}>
+                            {getMeetingSpeakerLabel(
+                              draft,
+                              meetingViewState.partial.speakerKind,
+                              meetingViewState.partial.source,
+                              meetingViewState.partial.speakerLabel,
+                            ).slice(0, 1)}
+                          </span>
+                        ) : null}
                         <div className="va-meeting-turn-copy">
-                          <div className="va-meeting-turn-meta">
-                            <strong>
-                              {getMeetingSpeakerLabel(
-                                draft,
-                                meetingViewState.partial.speakerKind,
-                                meetingViewState.partial.source,
-                                meetingViewState.partial.speakerLabel,
-                              )}
-                            </strong>
-                            <span>正在說話</span>
-                          </div>
+                          {draft.meetingSpeakerLabelsEnabled ? (
+                            <div className="va-meeting-turn-meta">
+                              <strong>
+                                {getMeetingSpeakerLabel(
+                                  draft,
+                                  meetingViewState.partial.speakerKind,
+                                  meetingViewState.partial.source,
+                                  meetingViewState.partial.speakerLabel,
+                                )}
+                              </strong>
+                              <span>正在說話</span>
+                            </div>
+                          ) : null}
                           <div className="va-meeting-turn-bubble va-meeting-turn-bubble-partial">
                             <p className="va-meeting-turn-source">{meetingViewState.partial.sourceText}</p>
                           </div>
@@ -2147,11 +2272,10 @@ function SettingsView({
                     value={draft.meetingSourceLang}
                     onChange={(event) => {
                       const lang = event.target.value;
-                      const recommended = getRecommendedSubtitleSttModel(lang, draft.meetingSttModel);
                       setDraft({
                         ...draft,
                         meetingSourceLang: lang,
-                        meetingSttModel: recommended,
+                        meetingSttModel: resolveSttModelForSourceLang(lang, draft.meetingSttModel),
                       });
                     }}
                   >
@@ -2185,7 +2309,9 @@ function SettingsView({
                       checked={meetingTranslationOn}
                       onChange={(event) => setDraft({
                         ...draft,
-                        meetingTranslateModel: event.target.checked ? 'google' : 'disabled',
+                        meetingTranslateModel: event.target.checked
+                          ? (draft.meetingSttModel === 'gemini-live' ? 'gemini-live' : 'google')
+                          : 'disabled',
                       })}
                     />
                     <span className="sr-only">啟用翻譯</span>
@@ -2255,10 +2381,23 @@ function SettingsView({
                     <strong>語音辨識引擎</strong>
                     {draft.meetingSttModel === 'apple-stt' ? <p>Apple STT 不支援多語自動判斷。</p> : null}
                     {draft.meetingSttModel === 'sensevoice' ? <p>SenseVoice 適合多人交替說話情境。</p> : null}
+                    {draft.meetingSttModel === 'breeze-asr-25' ? <p>Breeze 會在偵測到說話停頓後辨識該段，適合台灣中文與中英混說；不提供連續 partial 字幕。</p> : null}
+                    {draft.meetingSttModel === 'gemini-live' ? <p>Gemini Live 走雲端多語辨識與即時翻譯；dual source 會先以混音送出，不取代既有本地說話者分流。</p> : null}
                   </div>
                   <select
                     value={draft.meetingSttModel}
-                    onChange={(event) => setDraft({ ...draft, meetingSttModel: event.target.value })}
+                    onChange={(event) => {
+                      const nextModel = event.target.value;
+                      setDraft({
+                        ...draft,
+                        meetingSttModel: nextModel,
+                        meetingTranslateModel: nextModel === 'gemini-live'
+                          ? 'gemini-live'
+                          : draft.meetingTranslateModel === 'gemini-live'
+                            ? 'google'
+                            : draft.meetingTranslateModel,
+                      });
+                    }}
                     disabled={isMeetingStreaming}
                   >
                     {meetingAsrOptions.map((option) => (
@@ -2266,6 +2405,22 @@ function SettingsView({
                     ))}
                   </select>
                 </div>
+                {draft.meetingSttModel === 'gemini-live' && (
+                  <div className="bc-inline-field">
+                    <label className="settings-label">
+                      <span>Gemini API Key</span>
+                      <input
+                        type="password"
+                        value={draft.geminiApiKey}
+                        onChange={(event) => setDraft({ ...draft, geminiApiKey: event.target.value })}
+                        placeholder="AIza..."
+                        autoComplete="off"
+                        spellCheck={false}
+                      />
+                    </label>
+                    <p className="model-hint">同一組 key 會用於 Gemini Live 字幕與會議模式；也可由本機 .env 提供。</p>
+                  </div>
+                )}
               </div>
             </article>
           </div>
@@ -2289,7 +2444,7 @@ function SettingsView({
                         <p>{entry.description}</p>
                       </div>
                       <span className={`model-badge ${entry.ready ? 'model-badge-ready' : ''}`}>
-                        {entry.ready ? '已就緒' : '未下載'}
+                        {entry.ready ? '已就緒' : entry.runtimeAvailable ? '未下載' : '此版本未內建'}
                       </span>
                     </div>
                     <div className="model-card-meta">
@@ -2300,7 +2455,7 @@ function SettingsView({
                       {entry.ready ? (
                         <button className="secondary" disabled={isDownloading} onClick={() => window.app.deleteModel(entry.key)}>刪除</button>
                       ) : (
-                        <button disabled={isDownloading} onClick={() => window.app.downloadModel(entry.key)}>下載</button>
+                        <button disabled={isDownloading || !entry.runtimeAvailable} onClick={() => window.app.downloadModel(entry.key)}>下載</button>
                       )}
                     </div>
                   </article>
@@ -2324,7 +2479,7 @@ function SettingsView({
           <article className="va-card va-card-bodyless">
             <div className="bc-card-header">
               <h3 className="bc-card-title">雲端模型憑證</h3>
-              <p className="bc-card-hint">Groq Whisper 與雲端文字整理共用這組 API Key。</p>
+              <p className="bc-card-hint">管理線上 STT、雲端文字整理與 Gemini Live Translate 憑證。</p>
             </div>
             <div className="bc-card-body">
               <div className="va-stack-row">
@@ -2336,6 +2491,21 @@ function SettingsView({
                   value={draft.dictationCloudApiKey}
                   onChange={(event) => setDraft({ ...draft, dictationCloudApiKey: event.target.value })}
                   placeholder="gsk_..."
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </div>
+              <div className="va-divider" />
+              <div className="va-stack-row">
+                <div className="va-row-copy">
+                  <strong>Gemini API Key</strong>
+                  <p>用於 Gemini 3.5 Live Translate。</p>
+                </div>
+                <input
+                  type="password"
+                  value={draft.geminiApiKey}
+                  onChange={(event) => setDraft({ ...draft, geminiApiKey: event.target.value })}
+                  placeholder="AIza..."
                   autoComplete="off"
                   spellCheck={false}
                 />

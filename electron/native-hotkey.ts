@@ -64,7 +64,9 @@ export class NativeHotkeyBridge extends EventEmitter {
     });
 
     child.on('error', (error) => {
-      this.child = null;
+      if (this.child === child) {
+        this.child = null;
+      }
       this.emit('event', {
         type: 'error',
         message: error.message,
@@ -72,7 +74,9 @@ export class NativeHotkeyBridge extends EventEmitter {
     });
 
     child.on('exit', (code, signal) => {
-      this.child = null;
+      if (this.child === child) {
+        this.child = null;
+      }
       this.emit('event', {
         type: 'listener_stopped',
         message: signal ? `Exited via ${signal}` : `Exited with code ${String(code)}`,

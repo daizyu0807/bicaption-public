@@ -51,6 +51,8 @@ HAS_REAL_NUMPY = hasattr(np, "array")
 
 from sidecar import (
     AppleSttTranscriber,
+    BreezeAsrBatchTranscriber,
+    BreezeAsrMeetingTranscriber,
     SidecarApp,
     StreamingLinearResampler,
     assess_speaker_audio,
@@ -64,6 +66,10 @@ from sidecar import (
     LocalLlmRewriteProvider,
     MeetingSpeakerMatchStats,
     FallbackTranslator,
+    GEMINI_LIVE_AUDIO_CHUNK_SAMPLES,
+    GeminiLiveCaptionEvent,
+    GeminiLiveCaptionStabilizer,
+    GeminiLiveTranslateClient,
     build_dictation_final_event,
     build_dictation_state_event,
     DictationFragment,
@@ -95,6 +101,7 @@ from sidecar import (
     DictationRewriteResult,
     build_groq_transcription_prompt,
     build_meeting_mix_chunk,
+    get_streaming_transcriber,
     mix_meeting_audio_sources,
 )
 
@@ -132,6 +139,301 @@ class TranslationProviderTest(unittest.TestCase):
         transcriber._promoted_text = "然後是斷句的部分其實第一句可以斷"
         delta = transcriber._build_residual_delta("然後是斷句的部分其實第一句可以斷然後第二句開始他就不會斷句")
         self.assertEqual(delta, "然後第二句開始他就不會斷句")
+
+    def test_gemini_stabilizer_emits_partial_before_final(self) -> None:
+        stabilizer = GeminiLiveCaptionStabilizer(partial_stable_ms=500)
+        events = stabilizer.add_translation("hello", 1000)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "partial")
+        self.assertEqual(events[0].translated_text, "hello")
+
+    def test_gemini_stabilizer_flushes_after_stable_timeout(self) -> None:
+        stabilizer = GeminiLiveCaptionStabilizer(partial_stable_ms=500)
+        stabilizer.add_translation("hello", 1000)
+
+        # partial_stable_ms is floored at MIN_STABLE_MS (1500) for Gemini.
+        self.assertEqual(stabilizer.drain_due(2400), [])
+        events = stabilizer.drain_due(2600)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "final")
+        self.assertEqual(events[0].translated_text, "hello")
+
+    def test_gemini_stabilizer_merges_incremental_fragments(self) -> None:
+        stabilizer = GeminiLiveCaptionStabilizer(partial_stable_ms=500)
+        stabilizer.add_translation("hello", 1000)
+        events = stabilizer.add_translation("world.", 1100)
+
+        self.assertEqual([event.kind for event in events], ["partial", "final"])
+        self.assertEqual(events[-1].translated_text, "hello world.")
+        self.assertEqual(events[-1].segment_id, "gemini-live-1")
+
+    def test_gemini_stabilizer_merges_cumulative_revision(self) -> None:
+        stabilizer = GeminiLiveCaptionStabilizer(partial_stable_ms=500)
+        stabilizer.add_translation("hello wor", 1000)
+        events = stabilizer.add_translation("hello world.", 1100)
+
+        self.assertEqual(events[-1].kind, "final")
+        self.assertEqual(events[-1].translated_text, "hello world.")
+
+    def test_gemini_stabilizer_keeps_short_cjk_text_pending(self) -> None:
+        stabilizer = GeminiLiveCaptionStabilizer(partial_stable_ms=500)
+        events = stabilizer.add_translation("今天我們先確認語音輸入完成速度是否穩定", 1000)
+
+        # Below the runaway cap and without sentence punctuation the text
+        # stays pending (partial only) instead of being chopped mid-sentence.
+        self.assertEqual([event.kind for event in events], ["partial"])
+
+    def test_gemini_stabilizer_flushes_cjk_runaway_cap(self) -> None:
+        stabilizer = GeminiLiveCaptionStabilizer(partial_stable_ms=500)
+        long_text = "今天我們先確認語音輸入完成速度是否穩定" * 3
+        events = stabilizer.add_translation(long_text, 1000)
+
+        self.assertEqual([event.kind for event in events], ["partial", "final"])
+        self.assertEqual(events[-1].translated_text, long_text)
+
+    def test_gemini_stabilizer_can_emit_source_only_caption(self) -> None:
+        stabilizer = GeminiLiveCaptionStabilizer(partial_stable_ms=500)
+        events = stabilizer.add_source("hello team.", 1000, detected_lang="en", emit_as_caption=True)
+
+        self.assertEqual([event.kind for event in events], ["partial", "final"])
+        self.assertEqual(events[-1].source_text, "hello team.")
+        self.assertEqual(events[-1].translated_text, "")
+        self.assertEqual(events[-1].detected_lang, "en")
+
+    def test_gemini_stabilizer_flushes_source_only_after_timeout(self) -> None:
+        stabilizer = GeminiLiveCaptionStabilizer(partial_stable_ms=500)
+        stabilizer.add_source("hello", 1000, emit_as_caption=True)
+
+        self.assertEqual(stabilizer.drain_due(2400, include_source=True), [])
+        events = stabilizer.drain_due(2600, include_source=True)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "final")
+        self.assertEqual(events[0].source_text, "hello")
+        self.assertEqual(events[0].translated_text, "")
+
+    def test_gemini_stabilizer_drains_pending_source_even_with_translation_enabled(self) -> None:
+        # If Gemini never sends output transcripts (e.g. same-language input),
+        # accumulated source text must still flush instead of being held forever.
+        stabilizer = GeminiLiveCaptionStabilizer(partial_stable_ms=500)
+        stabilizer.add_source("怎麼沒有出現呢", 1000, emit_as_caption=False)
+
+        events = stabilizer.drain_due(2600)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "final")
+        self.assertEqual(events[0].source_text, "怎麼沒有出現呢")
+
+    def test_gemini_turn_complete_flushes_pending_caption(self) -> None:
+        app = SidecarApp()
+        app.config = types.SimpleNamespace(
+            mode="subtitle",
+            session_id="subtitle-gemini",
+            source_lang="auto",
+            target_lang="zh-TW",
+            translate_model="gemini-live",
+            partial_stable_ms=500,
+        )
+        app.gemini_live_stabilizer = GeminiLiveCaptionStabilizer(partial_stable_ms=500)
+        emitted: list[dict[str, object]] = []
+
+        with patch.object(sidecar_module, "emit", side_effect=emitted.append):
+            app._emit_gemini_live_event({"type": "input_transcript", "text": "hello there"}, 1000)
+            app._emit_gemini_live_event({"type": "turn_complete"}, 1400)
+
+        finals = [event for event in emitted if event.get("type") == "final_caption"]
+        self.assertEqual(len(finals), 1)
+        self.assertEqual(finals[0]["sourceText"], "hello there")
+
+    def test_gemini_client_throttles_queue_full_errors(self) -> None:
+        client = GeminiLiveTranslateClient(types.SimpleNamespace(gemini_api_key="test-key"))
+        overflow = np.zeros(GEMINI_LIVE_AUDIO_CHUNK_SAMPLES * (client.audio_queue.maxsize + 10), dtype=np.float32)
+
+        client.feed_audio(overflow)
+        client.feed_audio(overflow)
+
+        errors = [event for event in client.poll_events() if event.get("type") == "error"]
+        self.assertEqual(len(errors), 1)
+
+    def test_gemini_meeting_final_emits_meeting_caption_with_translation(self) -> None:
+        app = SidecarApp()
+        app.config = types.SimpleNamespace(
+            mode="meeting",
+            session_id="meeting-gemini",
+            source_lang="auto",
+            target_lang="zh-TW",
+            meeting_source_mode="microphone",
+            meeting_speaker_labels_enabled=True,
+        )
+        emitted: list[dict[str, object]] = []
+
+        with patch.object(sidecar_module, "emit", side_effect=emitted.append):
+            app._emit_gemini_caption_event(GeminiLiveCaptionEvent(
+                kind="final",
+                segment_id="gemini-live-1",
+                source_text="annyeonghaseyo",
+                translated_text="你好",
+                started_at_ms=1000,
+                ended_at_ms=1800,
+                detected_lang="ko",
+            ))
+
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(emitted[0]["type"], "meeting_caption")
+        self.assertEqual(emitted[0]["source"], "microphone")
+        self.assertEqual(emitted[0]["text"], "annyeonghaseyo")
+        self.assertEqual(emitted[0]["translatedText"], "你好")
+        self.assertEqual(emitted[0]["sourceLang"], "ko")
+
+    def test_gemini_meeting_dual_final_uses_system_source_for_mixed_audio(self) -> None:
+        app = SidecarApp()
+        app.config = types.SimpleNamespace(
+            mode="meeting",
+            session_id="meeting-gemini-dual",
+            source_lang="auto",
+            target_lang="en",
+            meeting_source_mode="dual",
+            meeting_speaker_labels_enabled=True,
+        )
+        emitted: list[dict[str, object]] = []
+
+        with patch.object(sidecar_module, "emit", side_effect=emitted.append):
+            app._emit_gemini_caption_event(GeminiLiveCaptionEvent(
+                kind="final",
+                segment_id="gemini-live-1",
+                source_text="회의를 시작하겠습니다",
+                translated_text="We will start the meeting.",
+                started_at_ms=1000,
+                ended_at_ms=2200,
+                detected_lang="ko",
+            ))
+
+        self.assertEqual(emitted[0]["type"], "meeting_caption")
+        self.assertEqual(emitted[0]["source"], "system")
+        self.assertEqual(emitted[0]["speakerKind"], "remote-default")
+
+    def test_gemini_meeting_dual_final_uses_microphone_when_mic_is_dominant(self) -> None:
+        app = SidecarApp()
+        app.config = types.SimpleNamespace(
+            mode="meeting",
+            session_id="meeting-gemini-dual-mic",
+            source_lang="auto",
+            target_lang="zh-TW",
+            meeting_source_mode="dual",
+            meeting_speaker_labels_enabled=True,
+        )
+        app.gemini_meeting_source_levels = [
+            (900, 2300, 0.035, 0.004),
+        ]
+        emitted: list[dict[str, object]] = []
+
+        with patch.object(sidecar_module, "emit", side_effect=emitted.append):
+            app._emit_gemini_caption_event(GeminiLiveCaptionEvent(
+                kind="final",
+                segment_id="gemini-live-1",
+                source_text="我現在開始說話",
+                translated_text="",
+                started_at_ms=1000,
+                ended_at_ms=2200,
+                detected_lang="zh",
+            ))
+
+        self.assertEqual(emitted[0]["type"], "meeting_caption")
+        self.assertEqual(emitted[0]["source"], "microphone")
+        self.assertEqual(emitted[0]["speakerKind"], "source-default")
+
+    def test_gemini_meeting_translation_disabled_uses_input_transcript(self) -> None:
+        app = SidecarApp()
+        app.config = types.SimpleNamespace(
+            mode="meeting",
+            session_id="meeting-gemini-source-only",
+            source_lang="auto",
+            target_lang="zh-TW",
+            translate_model="disabled",
+            partial_stable_ms=500,
+            meeting_source_mode="microphone",
+            meeting_speaker_labels_enabled=True,
+        )
+        app.gemini_live_stabilizer = GeminiLiveCaptionStabilizer(partial_stable_ms=500)
+        emitted: list[dict[str, object]] = []
+
+        with patch.object(sidecar_module, "emit", side_effect=emitted.append):
+            app._emit_gemini_live_event({
+                "type": "input_transcript",
+                "text": "hello team.",
+                "languageCode": "en",
+            }, 1000)
+
+        self.assertEqual([event.get("type") for event in emitted], ["partial_caption", "meeting_caption"])
+        self.assertEqual(emitted[-1]["text"], "hello team.")
+        self.assertEqual(emitted[-1]["translatedText"], "")
+        self.assertEqual(emitted[-1]["sourceLang"], "en")
+
+    def test_gemini_meeting_input_transcript_binds_microphone_source_hint(self) -> None:
+        app = SidecarApp()
+        app.config = types.SimpleNamespace(
+            mode="meeting",
+            session_id="meeting-gemini-source-hint",
+            source_lang="auto",
+            target_lang="zh-TW",
+            translate_model="disabled",
+            partial_stable_ms=500,
+            meeting_source_mode="dual",
+            meeting_speaker_labels_enabled=True,
+        )
+        app.gemini_live_stabilizer = GeminiLiveCaptionStabilizer(partial_stable_ms=500)
+        app.gemini_meeting_source_levels = [
+            (1000, 2000, 0.030, 0.006),
+            (2100, 2600, 0.001, 0.030),
+        ]
+        emitted: list[dict[str, object]] = []
+
+        with patch.object(sidecar_module, "emit", side_effect=emitted.append):
+            app._emit_gemini_live_event({
+                "type": "input_transcript",
+                "text": "我方第一句。",
+                "languageCode": "zh",
+            }, 1800)
+
+        self.assertEqual(emitted[-1]["type"], "meeting_caption")
+        self.assertEqual(emitted[-1]["source"], "microphone")
+        self.assertEqual(emitted[-1]["speakerKind"], "source-default")
+
+    def test_meeting_label_uses_configured_source_labels(self) -> None:
+        app = SidecarApp()
+        app.config = types.SimpleNamespace(
+            meeting_microphone_label="主持人",
+            meeting_system_label="來賓",
+        )
+
+        self.assertEqual(app._build_meeting_label("microphone"), ("microphone", "主持人"))
+        self.assertEqual(app._build_meeting_label("system"), ("system", "來賓"))
+
+    def test_gemini_meeting_translation_disabled_ignores_output_transcript(self) -> None:
+        app = SidecarApp()
+        app.config = types.SimpleNamespace(
+            mode="meeting",
+            session_id="meeting-gemini-no-translation",
+            source_lang="auto",
+            target_lang="zh-TW",
+            translate_model="disabled",
+            partial_stable_ms=500,
+            meeting_source_mode="microphone",
+            meeting_speaker_labels_enabled=True,
+        )
+        app.gemini_live_stabilizer = GeminiLiveCaptionStabilizer(partial_stable_ms=500)
+        emitted: list[dict[str, object]] = []
+
+        with patch.object(sidecar_module, "emit", side_effect=emitted.append):
+            app._emit_gemini_live_event({
+                "type": "output_transcript",
+                "text": "Starting recording",
+                "languageCode": "en",
+            }, 1000)
+
+        self.assertEqual(emitted, [])
 
     def test_meeting_loop_polls_apple_transcriber_during_silence(self) -> None:
         app = SidecarApp()
@@ -445,6 +747,69 @@ class TranslationProviderTest(unittest.TestCase):
         self.assertEqual(normalize_mlx_whisper_lang("zh-TW"), "zh")
         self.assertEqual(normalize_mlx_whisper_lang("en"), "en")
         self.assertIsNone(normalize_mlx_whisper_lang("auto"))
+
+    @unittest.skipUnless(HAS_REAL_NUMPY, "requires real numpy")
+    def test_breeze_asr_unavailable_emits_recoverable_error_without_output(self) -> None:
+        with patch.object(
+            sidecar_module,
+            "warm_breeze_asr_model",
+            side_effect=RuntimeError("missing runtime"),
+        ), patch.object(sidecar_module, "emit") as emit:
+            with self.assertRaisesRegex(RuntimeError, "Breeze ASR runtime unavailable"):
+                BreezeAsrBatchTranscriber(source_lang="zh-TW")
+        emitted = [call.args[0] for call in emit.call_args_list]
+        self.assertIn({"type": "error", "code": "breeze_asr_unavailable", "message": "Breeze ASR runtime 或固定版本模型尚未就緒。", "recoverable": True}, emitted)
+
+    def test_breeze_asr_meeting_uses_vad_segmented_transcriber(self) -> None:
+        config = types.SimpleNamespace(
+            stt_model="breeze-asr-25",
+            mode="meeting",
+            source_lang="auto",
+            partial_stable_ms=300,
+        )
+        with patch.object(sidecar_module, "BreezeAsrMeetingTranscriber") as transcriber_class:
+            instance = transcriber_class.return_value
+            self.assertIs(get_streaming_transcriber(config, announce=False), instance)
+        transcriber_class.assert_called_once_with(source_lang="auto", min_silence_duration=0.3)
+
+    @unittest.skipUnless(HAS_REAL_NUMPY, "requires real numpy")
+    def test_breeze_meeting_transcription_reuses_in_process_model_without_subprocess(self) -> None:
+        transcriber = object.__new__(BreezeAsrMeetingTranscriber)
+        transcriber._source_lang = "zh"
+        transcriber._segment_counter = 0
+        transcriber._failure_reported = False
+        audio = np.zeros(8_000, dtype=np.float32)
+
+        with patch.object(
+            sidecar_module,
+            "transcribe_breeze_asr_in_process",
+            return_value={"text": "會議字幕測試", "language": "zh"},
+        ) as transcribe, patch.object(sidecar_module.subprocess, "run") as subprocess_run:
+            chunks = transcriber.transcribe_buffer(audio, 2_000)
+
+        transcribe.assert_called_once()
+        subprocess_run.assert_not_called()
+        self.assertEqual(chunks[0].source_text, "會議字幕測試")
+
+    @unittest.skipUnless(HAS_REAL_NUMPY, "requires real numpy")
+    def test_breeze_dictation_reuses_in_process_model_without_subprocess(self) -> None:
+        transcriber = object.__new__(BreezeAsrBatchTranscriber)
+        transcriber._source_lang = "zh"
+        transcriber._initial_prompt = "BiCaption"
+        transcriber._segment_counter = 0
+        transcriber._failure_reported = False
+        audio = np.zeros(8_000, dtype=np.float32)
+
+        with patch.object(
+            sidecar_module,
+            "transcribe_breeze_asr_in_process",
+            return_value={"text": "語音輸入測試", "language": "zh"},
+        ) as transcribe, patch.object(sidecar_module.subprocess, "run") as subprocess_run:
+            chunks = transcriber.transcribe_buffer(audio, 2_000)
+
+        transcribe.assert_called_once_with(audio, "zh", "BiCaption")
+        subprocess_run.assert_not_called()
+        self.assertEqual(chunks[0].source_text, "語音輸入測試")
 
     def test_normalize_groq_transcription_lang_maps_traditional_chinese_and_auto(self) -> None:
         self.assertEqual(normalize_groq_transcription_lang("zh-TW"), "zh")

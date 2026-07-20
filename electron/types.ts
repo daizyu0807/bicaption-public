@@ -39,6 +39,7 @@ export interface CaptionConfig {
   dictationProperNounCorrectionEnabled?: boolean;
   dictationPersonalGlossary?: string;
   dictationCloudApiKey?: string;
+  geminiApiKey?: string;
   dictationCloudModel?: string;
   dictationCloudLlmPrompt?: string;
   dictationMaxRewriteExpansionRatio?: number;
@@ -47,6 +48,8 @@ export interface CaptionConfig {
   dictationLocalLlmPrompt?: string;
   meetingSourceMode?: 'system-audio' | 'microphone' | 'dual';
   meetingSpeakerLabelsEnabled?: boolean;
+  meetingMicrophoneLabel?: string;
+  meetingSystemLabel?: string;
   meetingLocalSpeakerVerificationEnabled?: boolean;
   meetingLocalSpeakerProfileId?: string;
   meetingLocalSpeakerFingerprint?: string;
@@ -299,6 +302,7 @@ export interface AppSettings {
   dictationProperNounCorrectionEnabled: boolean;
   dictationPersonalGlossary: string;
   dictationCloudApiKey: string;
+  geminiApiKey: string;
   dictationCloudModel: string;
   dictationCloudLlmPrompt: string;
   dictationLocalLlmModel: string;
@@ -342,6 +346,8 @@ export interface OverlayBounds {
 export interface ModelStatus {
   sensevoice: boolean;
   mlxWhisper: boolean;
+  breezeAsr: boolean;
+  breezeAsrRuntime: boolean;
   whisperTinyEn: boolean;
   whisperSmall: boolean;
   zipformerKo: boolean;
@@ -351,7 +357,7 @@ export interface ModelStatus {
 }
 
 export interface ModelDownloadProgress {
-  stage: 'sensevoice' | 'mlx-whisper' | 'whisper-tiny-en' | 'whisper-small' | 'zipformer-ko' | 'vad' | 'extracting';
+  stage: 'sensevoice' | 'mlx-whisper' | 'breeze-asr-25' | 'whisper-tiny-en' | 'whisper-small' | 'zipformer-ko' | 'vad' | 'extracting';
   percent: number;
   downloadedMB: number;
   totalMB: number;

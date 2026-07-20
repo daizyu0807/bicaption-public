@@ -4,4 +4,6 @@ sherpa-onnx>=1.10.0
 numpy<2
 sounddevice>=0.4.7
 deep-translator>=1.11.4
+websockets>=15.0
+google-genai>=2.8.0
 opencc-python-reimplemented>=0.1.7

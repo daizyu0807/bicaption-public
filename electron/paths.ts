@@ -40,7 +40,10 @@ function getDevAppleSttHelperPath() {
 
 export function getGlobalHotkeyCommand(): SidecarSpawnConfig {
   if (isPackaged()) {
-    const helperBin = join(process.resourcesPath!, 'sidecar', 'global-hotkey');
+    const helperAppBinary = join(process.resourcesPath!, 'GlobalHotkeyHelper.app', 'Contents', 'MacOS', 'global-hotkey');
+    const helperBin = existsSync(helperAppBinary)
+      ? helperAppBinary
+      : join(process.resourcesPath!, 'sidecar', 'global-hotkey');
     return {
       command: helperBin,
       args: [],
@@ -73,6 +76,13 @@ export function getAppleSttHelperAppPath(): string {
     return join(process.resourcesPath!, 'AppleSTTHelper.app');
   }
   return join(projectRoot, 'AppleSTTHelper.app');
+}
+
+export function getGlobalHotkeyHelperAppPath(): string {
+  if (isPackaged()) {
+    return join(process.resourcesPath!, 'GlobalHotkeyHelper.app');
+  }
+  return join(projectRoot, 'GlobalHotkeyHelper.app');
 }
 
 export function isPackaged(): boolean {

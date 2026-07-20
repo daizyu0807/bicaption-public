@@ -24,7 +24,13 @@ function normalizeDictationSttModel(model: string | undefined, sourceLang: strin
 
 function normalizeSubtitleSttModel(model: string | undefined, sourceLang: string | undefined): string {
   const candidate = (model ?? '').trim();
-  if (!candidate || candidate === 'moonshine' || candidate === 'whisper-mlx' || candidate === 'groq-whisper') {
+  if (candidate === 'gemini-live') {
+    return candidate;
+  }
+  if (sourceLang === 'auto' && candidate === 'apple-stt') {
+    return 'sensevoice';
+  }
+  if (!candidate || candidate === 'moonshine' || candidate === 'whisper-mlx' || candidate === 'groq-whisper' || candidate === 'breeze-asr-25') {
     return sourceLang === 'auto' ? 'sensevoice' : 'apple-stt';
   }
   return candidate;
@@ -32,10 +38,38 @@ function normalizeSubtitleSttModel(model: string | undefined, sourceLang: string
 
 function normalizeMeetingSttModel(model: string | undefined, sourceLang: string | undefined): string {
   const candidate = (model ?? '').trim();
+  if (candidate === 'gemini-live') {
+    return candidate;
+  }
+  if (sourceLang === 'auto' && candidate === 'apple-stt') {
+    return 'sensevoice';
+  }
   if (!candidate || candidate === 'moonshine' || candidate === 'whisper-mlx' || candidate === 'groq-whisper') {
     return sourceLang === 'auto' ? 'sensevoice' : 'apple-stt';
   }
   return candidate;
+}
+
+function normalizeSubtitleTranslateModel(sttModel: string, translateModel: string | undefined): string {
+  const candidate = (translateModel ?? '').trim();
+  if (sttModel === 'gemini-live') {
+    return 'gemini-live';
+  }
+  if (candidate === 'gemini-live') {
+    return 'google';
+  }
+  return candidate || defaultSettings.translateModel;
+}
+
+function normalizeMeetingTranslateModel(sttModel: string, translateModel: string | undefined): string {
+  const candidate = (translateModel ?? '').trim();
+  if (sttModel === 'gemini-live') {
+    return candidate === 'disabled' ? 'disabled' : 'gemini-live';
+  }
+  if (candidate === 'gemini-live') {
+    return 'google';
+  }
+  return candidate || defaultSettings.meetingTranslateModel;
 }
 
 function normalizeDictationRewriteMode(mode: AppSettings['dictationRewriteMode'] | undefined): AppSettings['dictationRewriteMode'] {
@@ -112,6 +146,7 @@ export const defaultSettings: AppSettings = {
 Codex
 Gemini CLI`,
   dictationCloudApiKey: '',
+  geminiApiKey: process.env.GEMINI_API_KEY || '',
   dictationCloudModel: 'auto',
   dictationCloudLlmPrompt: `你是語音輸入的雲端文字整理器。
 請根據目前模式，先修正辨識錯字與專有名詞，再決定是否進一步整理語句。
@@ -225,6 +260,14 @@ const store = new Store<AppSettings>({
 export function loadSettings(): AppSettings {
   const stored = store.store as Partial<AppSettings> & { deviceId?: string };
   const legacyDeviceId = stored.deviceId ?? '';
+  const subtitleSttModel = normalizeSubtitleSttModel(
+    stored.sttModel ?? defaultSettings.sttModel,
+    stored.sourceLang ?? defaultSettings.sourceLang,
+  );
+  const meetingSttModel = normalizeMeetingSttModel(
+    stored.meetingSttModel ?? defaultSettings.meetingSttModel,
+    stored.meetingSourceLang ?? stored.sourceLang ?? defaultSettings.meetingSourceLang,
+  );
   const current: AppSettings = {
     ...defaultSettings,
     ...stored,
@@ -247,17 +290,18 @@ export function loadSettings(): AppSettings {
     dictationVocabularyContext: stored.dictationVocabularyContext ?? defaultSettings.dictationVocabularyContext,
     dictationProperNounCorrectionEnabled: stored.dictationProperNounCorrectionEnabled ?? defaultSettings.dictationProperNounCorrectionEnabled,
     dictationPersonalGlossary: stored.dictationPersonalGlossary ?? defaultSettings.dictationPersonalGlossary,
+    geminiApiKey: stored.geminiApiKey ?? defaultSettings.geminiApiKey,
     dictationLocalLlmModel: normalizeDictationLocalLlmModel(stored.dictationLocalLlmModel),
     dictationCloudEnhancementEnabled: false,
     meetingMicDeviceId: stored.meetingMicDeviceId ?? legacyDeviceId ?? '',
     meetingSystemAudioDeviceId: stored.meetingSystemAudioDeviceId ?? stored.outputDeviceId ?? '',
     meetingSourceLang: stored.meetingSourceLang ?? stored.sourceLang ?? defaultSettings.meetingSourceLang,
     meetingTargetLang: stored.meetingTargetLang ?? stored.targetLang ?? defaultSettings.meetingTargetLang,
-    meetingSttModel: normalizeMeetingSttModel(
-      stored.meetingSttModel ?? defaultSettings.meetingSttModel,
-      stored.meetingSourceLang ?? stored.sourceLang ?? defaultSettings.meetingSourceLang,
+    meetingSttModel,
+    meetingTranslateModel: normalizeMeetingTranslateModel(
+      meetingSttModel,
+      stored.meetingTranslateModel ?? stored.translateModel ?? defaultSettings.meetingTranslateModel,
     ),
-    meetingTranslateModel: stored.meetingTranslateModel ?? stored.translateModel ?? defaultSettings.meetingTranslateModel,
     meetingSourceMode: stored.meetingSourceMode ?? defaultSettings.meetingSourceMode,
     meetingSpeakerLabelsEnabled: stored.meetingSpeakerLabelsEnabled ?? defaultSettings.meetingSpeakerLabelsEnabled,
     meetingMicrophoneLabel: stored.meetingMicrophoneLabel ?? defaultSettings.meetingMicrophoneLabel,
@@ -269,10 +313,8 @@ export function loadSettings(): AppSettings {
     meetingNotesPrompt: stored.meetingNotesPrompt ?? defaultSettings.meetingNotesPrompt,
     meetingSaveTranscript: stored.meetingSaveTranscript ?? defaultSettings.meetingSaveTranscript,
     meetingTranscriptDirectory: stored.meetingTranscriptDirectory ?? stored.saveDirectory ?? defaultSettings.meetingTranscriptDirectory,
-    sttModel: normalizeSubtitleSttModel(
-      stored.sttModel ?? defaultSettings.sttModel,
-      stored.sourceLang ?? defaultSettings.sourceLang,
-    ),
+    sttModel: subtitleSttModel,
+    translateModel: normalizeSubtitleTranslateModel(subtitleSttModel, stored.translateModel ?? defaultSettings.translateModel),
   };
   if (shouldApplyFastDictationDefaults(stored)) {
     current.dictationSttModel = getFastDictationSttModel(current.dictationSourceLang);
