@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { CaptionConfig, SessionUpdatePayload, SidecarEvent } from './types.js';
-import { getDebugTracePath, getManagedHuggingFaceHome, getSidecarCommand, getModelDir, getSpawnCwd } from './paths.js';
+import { getAppleTranslationPath, getDebugTracePath, getManagedHuggingFaceHome, getSidecarCommand, getModelDir, getSpawnCwd } from './paths.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ignoredStderrPatterns = [
@@ -77,6 +77,7 @@ export class SidecarBridge extends EventEmitter {
         KMP_WARNINGS: '0',
         MKL_VERBOSE: '0',
         BICAPTION_MODEL_DIR: getModelDir(),
+        BICAPTION_APPLE_TRANSLATION_HELPER: getAppleTranslationPath(),
         BICAPTION_TRACE_PATH: tracePath,
         HF_HOME: huggingFaceHome,
         HUGGINGFACE_HUB_CACHE: join(huggingFaceHome, 'hub'),

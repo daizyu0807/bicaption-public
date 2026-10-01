@@ -1,7 +1,7 @@
 {
   "name": "bicaption",
-  "version": "0.1.8",
-  "description": "Realtime bilingual caption overlay for macOS — local STT with SenseVoice + Google Translate",
+  "version": "0.1.11",
+  "description": "Realtime bilingual caption overlay for macOS — local STT with Apple on-device translation",
   "license": "MIT",
   "author": "davedai",
   "repository": {
@@ -14,7 +14,7 @@
   },
   "main": "dist/electron/main.js",
   "scripts": {
-    "dev": "node scripts/dev-electron.mjs",
+    "dev": "npm run build:apple-translation && node scripts/dev-electron.mjs",
     "build": "npm run build:electron && npm run build:renderer",
     "build:electron": "tsc -p tsconfig.electron.json",
     "build:renderer": "node scripts/run-vite.mjs build",
@@ -22,14 +22,14 @@
     "build:sidecar": "bash scripts/build-sidecar.sh",
     "build:sidecar:full": "BICAPTION_INCLUDE_LOCAL_LLM=1 bash scripts/build-sidecar.sh",
     "build:sidecar:breeze-asr": "BICAPTION_INCLUDE_BREEZE_ASR=1 bash scripts/build-sidecar.sh",
-    "dist": "npm run build && npm run build:global-hotkey && npm run build:sidecar:breeze-asr && electron-builder --mac && npm run verify:app",
-    "dist:unsigned": "npm run build && npm run build:global-hotkey && npm run build:sidecar:breeze-asr && electron-builder --mac --config.mac.identity=null",
-    "dist:breeze-asr": "npm run build && npm run build:global-hotkey && npm run build:sidecar:breeze-asr && electron-builder --mac && npm run verify:app",
+    "dist": "npm run build && npm run build:apple-translation && npm run build:apple-stt && npm run build:global-hotkey && npm run build:sidecar:breeze-asr && electron-builder --mac && npm run verify:app",
+    "dist:unsigned": "npm run build && npm run build:apple-translation && npm run build:apple-stt && npm run build:global-hotkey && npm run build:sidecar:breeze-asr && electron-builder --mac --config.mac.identity=null",
+    "dist:breeze-asr": "npm run build && npm run build:apple-translation && npm run build:apple-stt && npm run build:global-hotkey && npm run build:sidecar:breeze-asr && electron-builder --mac && npm run verify:app",
     "install:local-app": "bash scripts/install-local-app.sh",
     "verify:app": "bash scripts/verify-app-artifact.sh",
     "type-check": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.electron.json",
     "test": "tsx --test tests/**/*.test.ts",
-    "test:sidecar": ".venv/bin/python -m unittest python.tests.test_sidecar -v",
+    "test:sidecar": ".venv/bin/python -m unittest python.tests.test_sidecar -v && .venv/bin/python -m unittest python.tests.test_apple_translation -v",
     "sidecar:deps": "bash scripts/analyze-sidecar-deps.sh",
     "sidecar:torch-gate": "bash scripts/verify-torch-free-import.sh",
     "sidecar:venv:dry-run": "bash scripts/prepare-sidecar-packaging-venv.sh --dry-run --with-build-tool",
@@ -37,7 +37,9 @@
     "sidecar:legacy-packaging-gate": "bash scripts/check-sidecar-legacy-packaging.sh",
     "check:sidecar-dev": "npm run sidecar:legacy-packaging-gate && npm run sidecar:torch-gate && npm run sidecar:venv:dry-run && npm run sidecar:deps",
     "check:dev-acceptance": "npm run check:sidecar-dev && npm run type-check && npm test && npm run test:sidecar",
-    "start": "electron ."
+    "start": "electron .",
+    "build:apple-translation": "bash scripts/build-apple-translation.sh",
+    "build:apple-stt": "bash scripts/build-apple-stt.sh"
   },
   "dependencies": {
     "electron-store": "^10.1.0",
@@ -95,6 +97,10 @@
       {
         "from": "GlobalHotkeyHelper.app",
         "to": "GlobalHotkeyHelper.app"
+      },
+      {
+        "from": "AppleTranslationHelper.app",
+        "to": "AppleTranslationHelper.app"
       }
     ],
     "afterPack": "scripts/afterPack.cjs",

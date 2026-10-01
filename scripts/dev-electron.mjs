@@ -74,7 +74,7 @@ function assertPythonReady() {
   }
 
   try {
-    execFileSync(venvPython, ['-c', 'import numpy, sounddevice, deep_translator, opencc, sherpa_onnx'], {
+    execFileSync(venvPython, ['-c', 'import numpy, sounddevice, opencc, sherpa_onnx'], {
       stdio: 'ignore',
       cwd: projectRoot,
     });

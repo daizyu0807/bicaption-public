@@ -24,6 +24,7 @@ export interface MeetingViewState {
   sessionState: string;
   activeSessionId: string | null;
   lastError: string | null;
+  lastErrorCode: string | null;
 }
 
 export const initialMeetingViewState: MeetingViewState = {
@@ -32,6 +33,7 @@ export const initialMeetingViewState: MeetingViewState = {
   sessionState: 'idle',
   activeSessionId: null,
   lastError: null,
+  lastErrorCode: null,
 };
 
 function upsertMeetingEntry(entries: MeetingCaptionRecord[], nextEntry: MeetingCaptionRecord) {
@@ -92,6 +94,8 @@ export function reduceMeetingEvent(state: MeetingViewState, event: SidecarEvent)
       return {
         ...state,
         partial: null,
+        lastError: event.translatedText && state.lastErrorCode === 'translation_failed' ? null : state.lastError,
+        lastErrorCode: event.translatedText && state.lastErrorCode === 'translation_failed' ? null : state.lastErrorCode,
         entries: upsertMeetingEntry(state.entries, {
           id: event.segmentId,
           turnId: event.turnId,
@@ -120,6 +124,7 @@ export function reduceMeetingEvent(state: MeetingViewState, event: SidecarEvent)
           activeSessionId: event.sessionId,
           sessionState: event.state,
           lastError: null,
+          lastErrorCode: null,
         };
       }
       if (state.activeSessionId && event.sessionId !== state.activeSessionId) {
@@ -129,6 +134,8 @@ export function reduceMeetingEvent(state: MeetingViewState, event: SidecarEvent)
         ...state,
         sessionState: event.state,
         activeSessionId: event.state === 'stopped' || event.state === 'error' ? null : state.activeSessionId,
+        entries: (event.state === 'stopped' || event.state === 'error') && state.partial
+          ? upsertMeetingEntry(state.entries, state.partial) : state.entries,
         partial: event.state === 'stopped' || event.state === 'error' ? null : state.partial,
         lastError: event.state === 'error' ? event.detail ?? 'Unknown error' : state.lastError,
       };
@@ -139,6 +146,7 @@ export function reduceMeetingEvent(state: MeetingViewState, event: SidecarEvent)
       return {
         ...state,
         sessionState: 'stopped',
+        entries: state.partial ? upsertMeetingEntry(state.entries, state.partial) : state.entries,
         activeSessionId: null,
         partial: null,
       };
@@ -149,6 +157,7 @@ export function reduceMeetingEvent(state: MeetingViewState, event: SidecarEvent)
       return {
         ...state,
         lastError: event.message,
+        lastErrorCode: event.code,
         sessionState: event.recoverable ? state.sessionState : 'error',
       };
     case 'metrics':

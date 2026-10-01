@@ -161,3 +161,8 @@ export function getDictationLearningHistoryPath(): string {
   }
   return join(baseDir, 'dictation-learning-history.json');
 }
+
+export function getAppleTranslationPath(): string {
+  const base = isPackaged() ? process.resourcesPath! : projectRoot;
+  return join(base, 'AppleTranslationHelper.app', 'Contents', 'MacOS', 'apple-translation');
+}

@@ -1,4 +1,5 @@
 import type { AppSettings } from '../electron/types.js';
+import { migrateRetiredSttModel } from '../electron/stt-model-migration.js';
 
 // Apple SFSpeechRecognizer needs a fixed locale; the sidecar silently
 // falls back to en-US when it receives "auto", so the UI must not allow
@@ -10,6 +11,7 @@ export function sttModelSupportsAutoDetect(model: string): boolean {
 // Only correct combinations that would silently misbehave; never override
 // an engine the user picked on purpose.
 export function resolveSttModelForSourceLang(sourceLang: string, currentModel: string): string {
+  currentModel = migrateRetiredSttModel(currentModel, sourceLang);
   if (sourceLang === 'auto' && !sttModelSupportsAutoDetect(currentModel)) {
     return 'sensevoice';
   }
@@ -36,8 +38,6 @@ export function resolveTargetLangForSourceLang(
 export function isTranslationEnabled(
   settings: Pick<AppSettings, 'sttModel' | 'translateModel' | 'sourceLang' | 'targetLang'>,
 ): boolean {
-  if (settings.sttModel === 'gemini-live') return true;
-  if (settings.translateModel === 'gemini-live') return false;
   if (settings.translateModel === 'disabled') return false;
   return settings.sourceLang === 'auto' || settings.targetLang !== settings.sourceLang;
 }

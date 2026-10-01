@@ -1,3 +1,4 @@
+import { prepareAppleTranslation } from './apple-translation.js';
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, Tray, nativeImage, screen, shell, systemPreferences } from 'electron';
 import type { MessageBoxOptions } from 'electron';
 import { execFile, execFileSync } from 'node:child_process';
@@ -44,7 +45,7 @@ let dictationStartedAtMs: number | null = null;
 let pendingDictationCancel = false;
 let pendingDictationPasteTarget: FocusSnapshot | null = null;
 let dictationOverlayHideTimeout: NodeJS.Timeout | null = null;
-let overlayMode: 'hidden' | 'subtitle' | 'dictation' = 'hidden';
+let overlayMode: 'hidden' | 'subtitle' | 'dictation' | 'preview' = 'hidden';
 let subtitleOverlayBoundsCache: OverlayBounds | null = null;
 let dictationOverlayBoundsCache: OverlayBounds | null = null;
 let tray: Tray | null = null;
@@ -679,7 +680,7 @@ function sendToWindows(channel: string, payload: unknown) {
   }
 }
 
-function setOverlayMode(mode: 'hidden' | 'subtitle' | 'dictation') {
+function setOverlayMode(mode: 'hidden' | 'subtitle' | 'dictation' | 'preview') {
   if (overlayMode === mode) {
     return;
   }
@@ -976,11 +977,7 @@ async function tryPasteClipboard(action: DictationOutputAction, expectedTarget: 
 function buildSessionConfig(settings: AppSettings, mode: SessionMode): CaptionConfig {
   const isDictation = mode === 'dictation';
   const isMeeting = mode === 'meeting';
-  const subtitleTranslateModel = settings.sttModel === 'gemini-live'
-    ? 'gemini-live'
-    : settings.translateModel === 'gemini-live'
-      ? 'google'
-      : settings.translateModel;
+  const subtitleTranslateModel = settings.translateModel;
   const meetingPrimaryDeviceId = settings.meetingSourceMode === 'system-audio'
     ? settings.meetingSystemAudioDeviceId
     : settings.meetingMicDeviceId;
@@ -1009,7 +1006,6 @@ function buildSessionConfig(settings: AppSettings, mode: SessionMode): CaptionCo
     dictationProperNounCorrectionEnabled: isDictation ? settings.dictationProperNounCorrectionEnabled : undefined,
     dictationPersonalGlossary: isDictation ? settings.dictationPersonalGlossary : undefined,
     dictationCloudApiKey: isDictation ? settings.dictationCloudApiKey : undefined,
-    geminiApiKey: settings.geminiApiKey,
     dictationCloudModel: isDictation ? settings.dictationCloudModel : undefined,
     dictationCloudLlmPrompt: isDictation ? settings.dictationCloudLlmPrompt : undefined,
     dictationMaxRewriteExpansionRatio: isDictation ? settings.dictationMaxRewriteExpansionRatio : undefined,
@@ -1056,6 +1052,7 @@ function runMeetingLocalSpeakerEnrollment(request: MeetingEnrollSpeakerRequest):
 async function prepareSession(config: CaptionConfig) {
   overlaySuppressed = config.mode === 'subtitle' ? false : overlaySuppressed;
   if (config.mode === 'subtitle') {
+    setOverlayMode('subtitle');
     initSaveFile();
     meetingTranscriptFilePath = null;
   } else if (config.mode === 'meeting') {
@@ -1365,6 +1362,7 @@ function createSettingsWindow() {
     minWidth: 1120,
     minHeight: 720,
     title: 'BiCaption',
+    show: false,
     frame: false,
     backgroundColor: '#fbf5ea',
     webPreferences: {
@@ -1388,6 +1386,7 @@ function createSettingsWindow() {
     }
   });
 
+  settingsWindow.once('ready-to-show', () => showSettingsWindow());
   void settingsWindow.loadURL(rendererEntry);
   if (isDev && process.env.OPEN_DEVTOOLS === '1') {
     settingsWindow.webContents.openDevTools({ mode: 'detach' });
@@ -1399,6 +1398,9 @@ function showSettingsWindow() {
     createSettingsWindow();
   }
   app.dock?.show();
+  if (settingsWindow?.isMinimized()) {
+    settingsWindow.restore();
+  }
   settingsWindow?.show();
   settingsWindow?.focus();
 }
@@ -2155,6 +2157,26 @@ app.whenReady().then(() => {
     sendToWindows('settings:changed', nextSettings);
     return nextSettings;
   });
+  ipcMain.handle('permissions:check-speech', async () => {
+    const { command } = getAppleSttCommand();
+    if (!existsSync(command) || !readFileSync(command).includes(Buffer.from('--check-speech-permission'))) {
+      return { granted: false, available: false };
+    }
+    return new Promise((resolve) => execFile(command, ['--check-speech-permission'], { timeout: 5_000 }, (error, stdout) => {
+      try { resolve({ granted: !error && JSON.parse(stdout).granted === true, available: true }); }
+      catch { resolve({ granted: false, available: true }); }
+    }));
+  });
+  ipcMain.handle('permissions:request-speech', async () => {
+    const { command } = getAppleSttCommand();
+    if (!existsSync(command) || !readFileSync(command).includes(Buffer.from('--request-speech-permission'))) {
+      return { granted: false, available: false };
+    }
+    return new Promise((resolve) => execFile(command, ['--request-speech-permission'], { timeout: 60_000 }, (error, stdout) => {
+      try { resolve({ granted: !error && JSON.parse(stdout).granted === true, available: true }); }
+      catch { resolve({ granted: false, available: true }); }
+    }));
+  });
   ipcMain.handle('permissions:check-accessibility', () => checkAccessibilityPermission());
   ipcMain.handle('permissions:request-accessibility', () => requestAccessibilityPermission());
   ipcMain.handle('permissions:open-accessibility', () => openAccessibilitySettings());
@@ -2189,6 +2211,12 @@ app.whenReady().then(() => {
         const screenAccess = requestScreenRecordingPermission();
         if (!screenAccess.granted) {
           throw new Error('Screen recording permission was denied. Allow access in the system prompt or System Settings, then try again.');
+        }
+      }
+      if (config.mode !== 'dictation' && config.translateModel === 'apple-translation') {
+        const translation = await prepareAppleTranslation(config.sourceLang, config.targetLang, false, config.sttModel);
+        if (translation.status !== 'installed') {
+          throw new Error(translation.message ?? '請先在「使用準備」下載 Apple 翻譯語言包。');
         }
       }
       await prepareSession(config);
@@ -2313,6 +2341,13 @@ app.whenReady().then(() => {
   ipcMain.handle('meeting:export-report', (_event, request: MeetingReportRequest) => {
     return runMeetingReportExport(request);
   });
+  ipcMain.handle('translation:status', (_event, source: string, target: string, model: string) => prepareAppleTranslation(source, target, false, model));
+  ipcMain.handle('translation:prepare', (_event, source: string, target: string, model: string) => prepareAppleTranslation(source, target, true, model));
+  ipcMain.handle('permissions:check-microphone', () => ({ granted: systemPreferences.getMediaAccessStatus('microphone') === 'granted' }));
+  ipcMain.handle('permissions:request-microphone', async () => {
+    const granted = await systemPreferences.askForMediaAccess('microphone');
+    return { granted };
+  });
   ipcMain.handle('models:check', () => {
     return modelDownloader.checkStatus();
   });
@@ -2342,9 +2377,11 @@ app.whenReady().then(() => {
   nativeHotkeyBridge.on('event', forwardHotkeyEvent);
   restartDictationHotkeyListener();
 
+  ipcMain.handle('overlay:get-mode', () => ({ mode: overlayMode }));
   ipcMain.handle('overlay:show', () => {
+    if (activeSessionMode === 'dictation') throw new Error('請先完成這次聽寫，再開啟字幕預覽。');
     overlaySuppressed = false;
-    setOverlayMode('subtitle');
+    setOverlayMode(activeSessionMode === 'subtitle' ? 'subtitle' : 'preview');
     if (!overlayWindow || overlayWindow.isDestroyed()) {
       createOverlayWindow();
     }

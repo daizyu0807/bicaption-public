@@ -37,7 +37,6 @@ checks = [
     ("core:numpy", "numpy"),
     ("core:sounddevice", "sounddevice"),
     ("core:sherpa_onnx", "sherpa_onnx"),
-    ("core:deep_translator", "deep_translator"),
     ("core:opencc", "opencc"),
 ]
 if sys.argv[1].lower() in {"1", "true", "yes", "on"}:
@@ -61,7 +60,7 @@ section "Import-Time Torch Leakage"
 import importlib
 import sys
 
-modules = ["numpy", "sounddevice", "sherpa_onnx", "deep_translator", "opencc"]
+modules = ["numpy", "sounddevice", "sherpa_onnx", "opencc"]
 if sys.argv[1].lower() in {"1", "true", "yes", "on"}:
     modules.extend(["mlx_lm", "transformers"])
 
@@ -112,7 +111,6 @@ names = [
     "sherpa-onnx",
     "numpy",
     "sounddevice",
-    "deep-translator",
     "opencc-python-reimplemented",
     "mlx",
     "mlx-metal",

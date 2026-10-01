@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import base64
 import importlib
 import json
@@ -27,7 +26,6 @@ from typing import Any
 
 import numpy as np
 import sounddevice as sd
-from deep_translator import GoogleTranslator
 from opencc import OpenCC
 import sherpa_onnx
 
@@ -96,11 +94,6 @@ FALLBACK_FFMPEG_DIRS = (
     "/usr/local/bin",
 )
 METRICS_EMIT_INTERVAL_MS = 200
-GEMINI_LIVE_TRANSLATE_MODEL = "gemini-3.5-live-translate-preview"
-GEMINI_LIVE_AUDIO_CHUNK_SAMPLES = int(SAMPLE_RATE * 0.1)
-GEMINI_MEETING_SOURCE_HISTORY_MS = 30_000
-GEMINI_MEETING_SOURCE_RMS_RATIO = 0.8
-GEMINI_MEETING_SOURCE_MIN_RMS = 0.002
 
 
 def trace_debug(message: str) -> None:
@@ -1002,88 +995,15 @@ def resolve_device(device_id: str, require_input: bool = True) -> int | None:
     return None
 
 
+from apple_translation import AppleTranslationProvider
+
+
 class TranslationProvider:
     def translate(self, text: str, source_lang: str, target_lang: str) -> str:
         raise NotImplementedError
 
     def translate_many(self, texts: list[str], source_lang: str, target_lang: str) -> list[str]:
         return [self.translate(text, source_lang, target_lang) for text in texts]
-
-
-class GoogleTranslationProvider(TranslationProvider):
-    def __init__(self) -> None:
-        self.opencc = OpenCC("s2t")
-        self.cache: dict[tuple[str, str, str], str] = {}
-
-    def translate(self, text: str, source_lang: str, target_lang: str) -> str:
-        normalized = normalize_text(text)
-        if not normalized:
-            return ""
-        cache_key = (normalized.lower(), source_lang, target_lang.lower())
-        cached = self.cache.get(cache_key)
-        if cached is not None:
-            return cached
-        src = "auto" if source_lang in {"auto", ""} else source_lang
-        tgt_google = "zh-TW" if target_lang.lower() in {"zh-tw", "zh-hant"} else target_lang
-        for attempt in range(3):
-            try:
-                translator = GoogleTranslator(source=src, target=tgt_google)
-                translated = translator.translate(normalized).strip()
-                if target_lang.lower() in {"zh-tw", "zh-hant"}:
-                    translated = self.opencc.convert(translated)
-                self.cache[cache_key] = translated
-                return translated
-            except Exception as err:
-                print(f"[translate] attempt {attempt+1}/3 failed ({src}→{tgt_google}): {err}", file=sys.stderr)
-                if attempt < 2:
-                    time.sleep(0.5 * (attempt + 1))
-        return ""
-
-    def translate_many(self, texts: list[str], source_lang: str, target_lang: str) -> list[str]:
-        normalized_items = [normalize_text(text) for text in texts]
-        results = [""] * len(normalized_items)
-        missing_indexes: list[int] = []
-
-        for index, item in enumerate(normalized_items):
-            if not item:
-                continue
-            cache_key = (item.lower(), source_lang, target_lang.lower())
-            cached = self.cache.get(cache_key)
-            if cached is not None:
-                results[index] = cached
-            else:
-                missing_indexes.append(index)
-
-        if not missing_indexes:
-            return results
-
-        # Batch translate via newline-separated input
-        src = "auto" if source_lang in {"auto", ""} else source_lang
-        tgt_google = "zh-TW" if target_lang.lower() in {"zh-tw", "zh-hant"} else target_lang
-        batch_input = "\n".join(normalized_items[index] for index in missing_indexes)
-        try:
-            translator = GoogleTranslator(source=src, target=tgt_google)
-            translated_batch = translator.translate(batch_input).strip()
-            if target_lang.lower() in {"zh-tw", "zh-hant"}:
-                translated_batch = self.opencc.convert(translated_batch)
-            split_batch = [part.strip() for part in translated_batch.splitlines() if part.strip()]
-            if len(split_batch) == len(missing_indexes):
-                for offset, index in enumerate(missing_indexes):
-                    results[index] = split_batch[offset]
-                    cache_key = (normalized_items[index].lower(), source_lang, target_lang.lower())
-                    self.cache[cache_key] = split_batch[offset]
-                return results
-        except Exception as err:
-            print(f"[translate_many] batch failed ({src}→{tgt_google}): {err}", file=sys.stderr)
-
-        # Fallback: translate one by one
-        for index in missing_indexes:
-            results[index] = self.translate(normalized_items[index], source_lang, target_lang)
-        return results
-
-
-class FallbackTranslator(GoogleTranslationProvider):
-    pass
 
 
 def prefers_traditional_chinese(source_lang: str, target_lang: str, detected_lang: str = "") -> bool:
@@ -1119,7 +1039,6 @@ class SessionConfig:
     dictation_proper_noun_correction_enabled: bool = True
     dictation_personal_glossary: str = ""
     dictation_cloud_api_key: str = ""
-    gemini_api_key: str = ""
     dictation_cloud_model: str = ""
     dictation_cloud_llm_prompt: str = ""
     dictation_max_rewrite_expansion_ratio: float = 2.0
@@ -1138,370 +1057,20 @@ class SessionConfig:
     meeting_transcript_directory: str = ""
 
 
-def normalize_gemini_target_language(language: str) -> str:
-    normalized = (language or "").strip()
-    mapping = {
-        "zh": "zh-Hant",
-        "zh-tw": "zh-Hant",
-        "zh-hant": "zh-Hant",
-        "zh-cn": "zh-Hans",
-        "zh-hans": "zh-Hans",
-        "en-us": "en",
-        "en-gb": "en",
-        "ja-jp": "ja",
-        "ko-kr": "ko",
-    }
-    return mapping.get(normalized.lower(), normalized or "en")
 
 
-def resolve_gemini_api_key(config: SessionConfig | None) -> str:
-    if config is not None and config.gemini_api_key.strip():
-        return config.gemini_api_key.strip()
-    return os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip()
 
 
 def is_translate_model_enabled(model: str) -> bool:
     return (model or "").strip().lower() not in {"disabled", "off", "none"}
 
 
-def is_gemini_placeholder_text(text: str) -> bool:
-    return normalize_text(text).lower() in {"none", "null", "nil"}
 
 
-@dataclass
-class GeminiLiveCaptionEvent:
-    kind: str
-    segment_id: str
-    source_text: str
-    translated_text: str
-    started_at_ms: int
-    ended_at_ms: int
-    detected_lang: str = ""
-    source_hint: str = ""
 
 
-class GeminiLiveCaptionStabilizer:
-    SENTENCE_END_RE = re.compile(r'[.!?。！？]$')
-    # Sentence-ending punctuation and pauses (drain_due) are the primary cut
-    # points; the length caps below are a runaway guard only. Cutting on short
-    # lengths (the old 7-word/14-char thresholds) chopped captions mid-sentence.
-    MAX_PENDING_WORDS = 24
-    MAX_PENDING_CJK_CHARS = 48
-    # Pause-based flushing is only a fallback — turn_complete from the model is
-    # the primary cut point. Gemini transcript fragments pause well above
-    # local-STT partial cadence even mid-sentence, so keep this floor high
-    # (500ms subtitle / 80ms meeting settings would cut every gap).
-    MIN_STABLE_MS = 1500
-
-    def __init__(self, partial_stable_ms: int = 900) -> None:
-        self.partial_stable_ms = max(self.MIN_STABLE_MS, int(partial_stable_ms))
-        self._source_text = ""
-        self._translated_text = ""
-        self._started_at_ms = 0
-        self._last_update_ms = 0
-        self._segment_counter = 0
-        self._detected_lang = ""
-        self._source_hint = ""
-
-    @staticmethod
-    def _merge_fragment(current: str, fragment: str) -> str:
-        current = normalize_text(current)
-        fragment = normalize_text(fragment)
-        if not fragment:
-            return current
-        if not current:
-            return fragment
-        if fragment == current or current.endswith(fragment):
-            return current
-        if fragment.startswith(current):
-            return fragment
-        max_overlap = min(len(current), len(fragment))
-        for size in range(max_overlap, 0, -1):
-            if current[-size:] == fragment[:size]:
-                return normalize_text(current + fragment[size:])
-        separator = "" if (contains_cjk(current[-1:]) or contains_cjk(fragment[:1])) else " "
-        return normalize_text(current + separator + fragment)
-
-    def add_source(
-        self,
-        text: str,
-        now: int,
-        detected_lang: str = "",
-        emit_as_caption: bool = False,
-        source_hint: str = "",
-    ) -> list[GeminiLiveCaptionEvent]:
-        normalized = normalize_text(text)
-        if not normalized:
-            return []
-        if self._started_at_ms == 0:
-            self._started_at_ms = now
-        previous = self._source_text
-        self._source_text = self._merge_fragment(self._source_text, normalized)
-        self._detected_lang = detected_lang or self._detected_lang
-        self._source_hint = source_hint or self._source_hint
-        self._last_update_ms = now
-        if not emit_as_caption or self._source_text == previous:
-            return []
-        partial = self._build_event("partial", now)
-        if self._should_flush(self._source_text):
-            return [partial, self.flush(now)]
-        return [partial]
-
-    def _pending_text(self, include_source: bool = False) -> str:
-        if self._translated_text:
-            return self._translated_text
-        return self._source_text if include_source else ""
-
-    def add_translation(
-        self,
-        text: str,
-        now: int,
-        detected_lang: str = "",
-        source_hint: str = "",
-    ) -> list[GeminiLiveCaptionEvent]:
-        normalized = normalize_text(text)
-        if not normalized:
-            return []
-        if self._started_at_ms == 0:
-            self._started_at_ms = now
-        previous = self._translated_text
-        self._translated_text = self._merge_fragment(self._translated_text, normalized)
-        self._detected_lang = detected_lang or self._detected_lang
-        self._source_hint = source_hint or self._source_hint
-        self._last_update_ms = now
-        if self._translated_text == previous:
-            return []
-        partial = self._build_event("partial", now)
-        if self._should_flush(self._translated_text):
-            return [partial, self.flush(now)]
-        return [partial]
-
-    def drain_due(self, now: int, include_source: bool = True) -> list[GeminiLiveCaptionEvent]:
-        if not self._pending_text(include_source) or self._last_update_ms == 0:
-            return []
-        if now - self._last_update_ms < self.partial_stable_ms:
-            return []
-        return [self.flush(now)]
-
-    def has_pending(self, include_source: bool = True) -> bool:
-        return bool(self._pending_text(include_source))
-
-    def flush(self, now: int) -> GeminiLiveCaptionEvent:
-        event = self._build_event("final", now)
-        self._source_text = ""
-        self._translated_text = ""
-        self._started_at_ms = 0
-        self._last_update_ms = 0
-        self._detected_lang = ""
-        self._source_hint = ""
-        return event
-
-    def _build_event(self, kind: str, now: int) -> GeminiLiveCaptionEvent:
-        if kind == "final":
-            self._segment_counter += 1
-            segment_id = f"gemini-live-{self._segment_counter}"
-        else:
-            segment_id = f"gemini-live-{self._segment_counter + 1}"
-        return GeminiLiveCaptionEvent(
-            kind=kind,
-            segment_id=segment_id,
-            source_text=self._source_text,
-            translated_text=self._translated_text,
-            started_at_ms=self._started_at_ms or now,
-            ended_at_ms=now,
-            detected_lang=self._detected_lang,
-            source_hint=self._source_hint,
-        )
-
-    def _should_flush(self, text: str) -> bool:
-        if self.SENTENCE_END_RE.search(text):
-            return True
-        if contains_cjk(text):
-            return count_transcript_units(text) >= self.MAX_PENDING_CJK_CHARS
-        return count_words(text) >= self.MAX_PENDING_WORDS
 
 
-class GeminiLiveTranslateClient:
-    # Gemini Live closes long connections (GoAway/1008 once the session
-    # duration limit is reached), so the stream loop must reconnect instead
-    # of dying — meetings routinely outlive a single connection.
-    RECONNECT_BACKOFF_S = 1.0
-    QUEUE_FULL_EMIT_INTERVAL_MS = 5000
-
-    def __init__(self, config: SessionConfig) -> None:
-        self.config = config
-        self.api_key = resolve_gemini_api_key(config)
-        self.audio_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=80)
-        self.events: queue.Queue[dict[str, Any]] = queue.Queue()
-        self.stop_event = threading.Event()
-        self.thread: threading.Thread | None = None
-        self._last_queue_full_emit_ms = 0
-        self._sent_chunks = 0
-        self._received_responses = 0
-
-    def start(self) -> None:
-        if not self.api_key:
-            raise RuntimeError("Gemini API Key is required for Gemini Live Translate.")
-        if self.thread is not None and self.thread.is_alive():
-            return
-        self.thread = threading.Thread(target=self._run_thread, daemon=True)
-        self.thread.start()
-
-    def stop(self) -> None:
-        self.stop_event.set()
-        try:
-            self.audio_queue.put_nowait(None)
-        except queue.Full:
-            pass
-        if self.thread is not None and self.thread.is_alive():
-            self.thread.join(timeout=1.5)
-        self.thread = None
-
-    def feed_audio(self, samples: np.ndarray) -> None:
-        if samples.size == 0 or self.stop_event.is_set():
-            return
-        pcm16 = np.clip(samples.astype(np.float32), -1.0, 1.0)
-        pcm16 = (pcm16 * 32767).astype(np.int16)
-        for start in range(0, pcm16.size, GEMINI_LIVE_AUDIO_CHUNK_SAMPLES):
-            chunk = pcm16[start:start + GEMINI_LIVE_AUDIO_CHUNK_SAMPLES]
-            if chunk.size == 0:
-                continue
-            try:
-                self.audio_queue.put_nowait(chunk.tobytes())
-            except queue.Full:
-                now = now_ms()
-                if now - self._last_queue_full_emit_ms >= self.QUEUE_FULL_EMIT_INTERVAL_MS:
-                    self._last_queue_full_emit_ms = now
-                    self.events.put({
-                        "type": "error",
-                        "message": "Gemini Live Translate audio queue is full; dropping audio.",
-                        "recoverable": True,
-                    })
-                break
-
-    def poll_events(self) -> list[dict[str, Any]]:
-        results: list[dict[str, Any]] = []
-        while True:
-            try:
-                results.append(self.events.get_nowait())
-            except queue.Empty:
-                break
-        return results
-
-    def _run_thread(self) -> None:
-        while not self.stop_event.is_set():
-            try:
-                asyncio.run(self._run())
-            except Exception as error:
-                if self.stop_event.is_set():
-                    break
-                trace_debug(f"gemini_live connection lost, reconnecting error={error}")
-                self.events.put({
-                    "type": "error",
-                    "message": f"Gemini Live Translate connection lost, reconnecting: {error}",
-                    "recoverable": True,
-                })
-            if self.stop_event.is_set():
-                break
-            # Reconnect (session duration limit, GoAway, transient network
-            # failure). Stale audio predates the new connection — drop it so
-            # the queue does not flood and Gemini does not transcribe the past.
-            self._drain_stale_audio()
-            self.stop_event.wait(self.RECONNECT_BACKOFF_S)
-
-    def _drain_stale_audio(self) -> None:
-        while True:
-            try:
-                self.audio_queue.get_nowait()
-            except queue.Empty:
-                return
-
-    async def _run(self) -> None:
-        try:
-            from google import genai
-            from google.genai import types
-        except ImportError as error:
-            raise RuntimeError("Missing Python dependency: google-genai. Run: pip install -r python/requirements.txt") from error
-
-        target_language = normalize_gemini_target_language(self.config.target_lang)
-        client = genai.Client(api_key=self.api_key)
-        config_kwargs: dict[str, Any] = {
-            "response_modalities": ["AUDIO"],
-            "input_audio_transcription": types.AudioTranscriptionConfig(),
-        }
-        if is_translate_model_enabled(self.config.translate_model):
-            config_kwargs["output_audio_transcription"] = types.AudioTranscriptionConfig()
-            config_kwargs["translation_config"] = types.TranslationConfig(
-                target_language_code=target_language,
-                echo_target_language=True,
-            )
-        config = types.LiveConnectConfig(**config_kwargs)
-        trace_debug(f"gemini_live connecting translate_enabled={is_translate_model_enabled(self.config.translate_model)} target={target_language}")
-        async with client.aio.live.connect(model=GEMINI_LIVE_TRANSLATE_MODEL, config=config) as session:
-            trace_debug("gemini_live connected")
-            sender = asyncio.create_task(self._send_audio_loop(session, types))
-            receiver = asyncio.create_task(self._receive_loop(session))
-            done, pending = await asyncio.wait(
-                {sender, receiver},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            for task in done:
-                task.result()
-
-    async def _send_audio_loop(self, session: Any, types: Any) -> None:
-        while not self.stop_event.is_set():
-            try:
-                # Bounded get so a cancelled sender does not leave a worker
-                # thread parked on the queue stealing chunks from the next
-                # connection's sender.
-                chunk = await asyncio.to_thread(self.audio_queue.get, True, 0.25)
-            except queue.Empty:
-                continue
-            if chunk is None:
-                break
-            self._sent_chunks += 1
-            if self._sent_chunks == 1 or self._sent_chunks % 200 == 0:
-                trace_debug(f"gemini_live sent_chunks={self._sent_chunks}")
-            await session.send_realtime_input(
-                audio=types.Blob(
-                    data=chunk,
-                    mime_type="audio/pcm;rate=16000",
-                )
-            )
-
-    async def _receive_loop(self, session: Any) -> None:
-        async for response in session.receive():
-            if self.stop_event.is_set():
-                break
-            self._received_responses += 1
-            if self._received_responses == 1 or self._received_responses % 100 == 0:
-                trace_debug(f"gemini_live received_responses={self._received_responses}")
-            server_content = getattr(response, "server_content", None)
-            if server_content is None:
-                continue
-            if getattr(server_content, "turn_complete", False):
-                # The model's own utterance boundary — the natural caption cut
-                # point, far better aligned than length or pause heuristics.
-                self.events.put({"type": "turn_complete"})
-            input_transcription = getattr(server_content, "input_transcription", None)
-            output_transcription = getattr(server_content, "output_transcription", None)
-            input_text = normalize_text(str(getattr(input_transcription, "text", "") if input_transcription else ""))
-            output_text = normalize_text(str(getattr(output_transcription, "text", "") if output_transcription else ""))
-            if input_text and not is_gemini_placeholder_text(input_text):
-                self.events.put({
-                    "type": "input_transcript",
-                    "text": input_text,
-                    "languageCode": getattr(input_transcription, "language_code", "") if input_transcription else "",
-                })
-            if output_text and not is_gemini_placeholder_text(output_text):
-                self.events.put({
-                    "type": "output_transcript",
-                    "text": output_text,
-                    "languageCode": getattr(output_transcription, "language_code", "") if output_transcription else "",
-                })
 
 
 @dataclass
@@ -4041,21 +3610,12 @@ class AppleSttTranscriber:
         return None
 
     def _is_duplicate(self, text: str) -> bool:
-        """Check if text substantially overlaps with recently promoted chunks."""
-        if not self._recent_promoted:
-            return False
-        new_words = set(normalize_text(text).lower().split())
-        if not new_words:
-            return False
-        for prev in self._recent_promoted:
-            prev_words = set(normalize_text(prev).lower().split())
-            if not prev_words:
-                continue
-            overlap = len(new_words & prev_words)
-            # If >60% of the new text's words already appeared in a recent
-            # promoted chunk, treat it as a duplicate.
-            if overlap / len(new_words) > 0.6:
-                return True
+        """Text similarity cannot establish an audio/event duplicate.
+
+        Cumulative replay is removed by promoted offsets. Distinct speech may
+        repeat verbatim or differ only by a negation/number, so never discard
+        it based on vocabulary overlap. Retain the method for legacy callers.
+        """
         return False
 
     def _record_promoted(self, text: str) -> None:
@@ -4409,8 +3969,6 @@ class SidecarApp:
         self.capture: AudioCapture | None = None
         self.transcriber: SenseVoiceTranscriber | MoonshineTranscriber | WhisperTinyEnTranscriber | WhisperSmallTranscriber | ZipformerKoreanTranscriber | AppleSttTranscriber | None = None
         self.translator: TranslationProvider | None = None
-        self.gemini_live: GeminiLiveTranslateClient | None = None
-        self.gemini_live_stabilizer: GeminiLiveCaptionStabilizer | None = None
         self.opencc_s2t = OpenCC("s2t")
         self.dictation_parts: list[str | DictationFragment] = []
         self.dictation_started_at_ms = 0
@@ -4434,7 +3992,6 @@ class SidecarApp:
         self.meeting_mix_pending_microphone: np.ndarray | None = None
         self.meeting_mix_pending_system: np.ndarray | None = None
         self.meeting_recent_system_chunks: list[tuple[int, str]] = []
-        self.gemini_meeting_source_levels: list[tuple[int, int, float, float]] = []
         self._last_metrics_emitted_at_ms = 0
         self.translation_worker = threading.Thread(target=self._translation_loop, daemon=True)
         self.translation_worker.start()
@@ -4615,7 +4172,7 @@ class SidecarApp:
             source_lang=str(payload.get("sourceLang", "auto")),
             target_lang=str(payload.get("targetLang", "zh-TW")),
             stt_model=str(payload.get("sttModel", "sensevoice")),
-            translate_model=str(payload.get("translateModel", "google")),
+            translate_model=str(payload.get("translateModel", "apple-translation")),
             chunk_ms=int(payload.get("chunkMs", 400)),
             partial_stable_ms=int(payload.get("partialStableMs", 500)),
             dictation_rewrite_mode=str(payload.get("dictationRewriteMode", "disabled")),
@@ -4626,7 +4183,6 @@ class SidecarApp:
             dictation_proper_noun_correction_enabled=bool(payload.get("dictationProperNounCorrectionEnabled", True)),
             dictation_personal_glossary=str(payload.get("dictationPersonalGlossary", "")),
             dictation_cloud_api_key=str(payload.get("dictationCloudApiKey", "")),
-            gemini_api_key=str(payload.get("geminiApiKey", "")),
             dictation_cloud_model=str(payload.get("dictationCloudModel", "")),
             dictation_cloud_llm_prompt=str(payload.get("dictationCloudLlmPrompt", "")),
             dictation_max_rewrite_expansion_ratio=float(payload.get("dictationMaxRewriteExpansionRatio", 1.3)),
@@ -4660,7 +4216,6 @@ class SidecarApp:
             self.meeting_last_turn_source = ""
             self.meeting_last_turn_end_ms = 0
             self.meeting_recent_system_chunks = []
-            self.gemini_meeting_source_levels = []
             self.meeting_local_speaker_reference = parse_speaker_fingerprint(self.config.meeting_local_speaker_fingerprint)
             self.meeting_match_stats = MeetingSpeakerMatchStats()
             self._init_meeting_audio_writers()
@@ -4675,15 +4230,7 @@ class SidecarApp:
             self.capture = AudioCapture(self.config.device_id, self.config.chunk_ms, self.config.output_device_id,
                                         sck_pipe_path=sck_pipe, sck_sample_rate=sck_sr)
             self.capture.start()
-            if (
-                (self.config.mode == "subtitle" and self.config.translate_model == "gemini-live")
-                or (self.config.mode == "meeting" and self.config.stt_model == "gemini-live")
-            ):
-                self.transcriber = None
-                self.gemini_live_stabilizer = GeminiLiveCaptionStabilizer(self.config.partial_stable_ms)
-                self.gemini_live = GeminiLiveTranslateClient(self.config)
-                self.gemini_live.start()
-            elif self.config.mode == "meeting":
+            if self.config.mode == "meeting":
                 self.transcriber = None
                 if self.config.meeting_source_mode in {"microphone", "dual"}:
                     self.meeting_mic_transcriber = get_streaming_transcriber(self.config, announce=False)
@@ -4691,13 +4238,14 @@ class SidecarApp:
                     self.meeting_system_transcriber = get_streaming_transcriber(self.config, announce=False)
             else:
                 self.transcriber = get_streaming_transcriber(self.config)
-            if self.config.translate_model in {"disabled", "off", "none", "gemini-live"}:
+            if self.config.translate_model in {"disabled", "off", "none"}:
                 self.translator = None
             else:
                 try:
-                    self.translator = GoogleTranslationProvider()
+                    self.translator = AppleTranslationProvider(
+                        source_languages=["en", "zh-Hant", "zh-Hans"] if self.config.stt_model == "breeze-asr-25" else None)
                 except Exception as error:
-                    emit({"type": "error", "code": "translation_provider_fallback", "message": str(error), "recoverable": True})
+                    emit({"type": "error", "code": "translation_failed", "message": str(error), "recoverable": True})
                     self.translator = None
         except Exception as error:
             emit({"type": "error", "code": "session_start_failed", "message": str(error), "recoverable": True})
@@ -4706,9 +4254,6 @@ class SidecarApp:
                 self.capture.stop()
             self.capture = None
             self.transcriber = None
-            if self.gemini_live is not None:
-                self.gemini_live.stop()
-                self.gemini_live = None
             self.meeting_mic_transcriber = None
             self.meeting_system_transcriber = None
             self.translator = None
@@ -4759,9 +4304,6 @@ class SidecarApp:
                     )
                     next_transcriber._segment_counter = self.meeting_system_transcriber._segment_counter
                     self.meeting_system_transcriber = next_transcriber
-                if self.gemini_live_stabilizer is not None:
-                    self.gemini_live_stabilizer.partial_stable_ms = max(
-                        GeminiLiveCaptionStabilizer.MIN_STABLE_MS, self.config.partial_stable_ms)
         emit({
             "type": "session_state",
             "mode": self.config.mode,
@@ -4876,10 +4418,6 @@ class SidecarApp:
             self.capture.stop()
             self.capture = None
 
-        if self.gemini_live is not None:
-            self.gemini_live.stop()
-            self.gemini_live = None
-        self.gemini_live_stabilizer = None
         
         # Stop remaining transcribers
         if self.transcriber is not None:
@@ -4911,206 +4449,12 @@ class SidecarApp:
     def _convert_s2t(self, text: str) -> str:
         return self.opencc_s2t.convert(text)
 
-    def _emit_gemini_caption_event(self, caption: GeminiLiveCaptionEvent) -> None:
-        if self.config is None:
-            return
-        if self.config.mode == "meeting":
-            self._emit_gemini_meeting_caption_event(caption)
-            return
-        source_text = caption.source_text or caption.translated_text
-        translated_text = caption.translated_text
-        if contains_cjk(source_text) and (
-            self.config.source_lang.lower() in {"zh-tw", "zh-hant"}
-            or self.config.target_lang.lower() in {"zh-tw", "zh-hant"}
-        ):
-            source_text = self._convert_s2t(source_text)
-        if contains_cjk(translated_text) and self.config.target_lang.lower() in {"zh-tw", "zh-hant"}:
-            translated_text = self._convert_s2t(translated_text)
-        if caption.kind == "partial":
-            emit({
-                "type": "partial_caption",
-                "mode": self.config.mode,
-                "sessionId": self.config.session_id,
-                "segmentId": caption.segment_id,
-                "sourceText": source_text,
-                "startedAtMs": caption.started_at_ms,
-                "updatedAtMs": caption.ended_at_ms,
-            })
-            return
-        emit({
-            "type": "final_caption",
-            "mode": self.config.mode,
-            "sessionId": self.config.session_id,
-            "segmentId": caption.segment_id,
-            "sourceText": source_text,
-            "translatedText": translated_text,
-            "startedAtMs": caption.started_at_ms,
-            "endedAtMs": caption.ended_at_ms,
-            "latencyMs": now_ms() - caption.started_at_ms,
-            "confidence": 0.0,
-            "detectedLang": caption.detected_lang,
-        })
 
-    def _get_gemini_meeting_source(self, caption: GeminiLiveCaptionEvent) -> str:
-        if caption.source_hint in {"microphone", "system"}:
-            return caption.source_hint
-        if self.config is not None and self.config.meeting_source_mode == "microphone":
-            return "microphone"
-        if self.config is not None and self.config.meeting_source_mode == "dual":
-            return self._resolve_gemini_meeting_dual_source(caption.started_at_ms, caption.ended_at_ms)
-        return "system"
 
-    def _record_gemini_meeting_source_level(
-        self,
-        started_at_ms: int,
-        ended_at_ms: int,
-        microphone: np.ndarray,
-        system: np.ndarray,
-    ) -> None:
-        if ended_at_ms <= started_at_ms:
-            return
-        self.gemini_meeting_source_levels.append((
-            started_at_ms,
-            ended_at_ms,
-            calculate_rms(microphone),
-            calculate_rms(system),
-        ))
-        cutoff = ended_at_ms - GEMINI_MEETING_SOURCE_HISTORY_MS
-        self.gemini_meeting_source_levels = [
-            item for item in self.gemini_meeting_source_levels
-            if item[1] >= cutoff
-        ]
 
-    def _resolve_gemini_meeting_dual_source(self, start: int, end: int) -> str:
-        if self.config is None:
-            return "system"
-        if end <= 0:
-            return "system"
-        start = max(1, start)
-        mic_score = 0.0
-        system_score = 0.0
-        total_weight = 0
-        for item_start, item_end, mic_rms, system_rms in self.gemini_meeting_source_levels:
-            overlap = max(0, min(end, item_end) - max(start, item_start))
-            if overlap <= 0:
-                continue
-            mic_score += mic_rms * overlap
-            system_score += system_rms * overlap
-            total_weight += overlap
-        if total_weight <= 0:
-            return "system"
-        mic_score /= total_weight
-        system_score /= total_weight
-        if mic_score >= GEMINI_MEETING_SOURCE_MIN_RMS and mic_score >= system_score * GEMINI_MEETING_SOURCE_RMS_RATIO:
-            return "microphone"
-        return "system"
 
-    def _get_gemini_meeting_source_hint(self, reference_ms: int) -> str:
-        if self.config is None:
-            return ""
-        if self.config.meeting_source_mode == "microphone":
-            return "microphone"
-        if self.config.meeting_source_mode == "system-audio":
-            return "system"
-        if self.config.meeting_source_mode != "dual":
-            return ""
-        return self._resolve_gemini_meeting_dual_source(reference_ms - 2500, reference_ms + 200)
 
-    def _emit_gemini_meeting_caption_event(self, caption: GeminiLiveCaptionEvent) -> None:
-        if self.config is None:
-            return
-        source_text = caption.source_text or caption.translated_text
-        translated_text = caption.translated_text
-        if contains_cjk(source_text) and (
-            self.config.source_lang.lower() in {"zh-tw", "zh-hant"}
-            or self.config.target_lang.lower() in {"zh-tw", "zh-hant"}
-        ):
-            source_text = self._convert_s2t(source_text)
-        if contains_cjk(translated_text) and self.config.target_lang.lower() in {"zh-tw", "zh-hant"}:
-            translated_text = self._convert_s2t(translated_text)
-        if caption.kind == "partial":
-            emit({
-                "type": "partial_caption",
-                "mode": self.config.mode,
-                "sessionId": self.config.session_id,
-                "segmentId": caption.segment_id,
-                "sourceText": source_text,
-                "startedAtMs": caption.started_at_ms,
-                "updatedAtMs": caption.ended_at_ms,
-            })
-            return
 
-        source = self._get_gemini_meeting_source(caption)
-        speaker_id, speaker_label = self._build_meeting_label(source)
-        chunk = TranscriptChunk(
-            mode="meeting",
-            session_id=self.config.session_id,
-            segment_id=caption.segment_id,
-            source_text=source_text,
-            started_at_ms=caption.started_at_ms,
-            ended_at_ms=caption.ended_at_ms,
-            confidence=0.0,
-            detected_lang=caption.detected_lang,
-        )
-        meeting_chunk = MeetingChunk(
-            chunk=chunk,
-            source=source,
-            turn_id=self._assign_meeting_turn_id(source, chunk),
-            speaker_id=speaker_id,
-            speaker_label=speaker_label,
-            speaker_kind="remote-default" if source == "system" else "source-default",
-        )
-        self._emit_meeting_chunk(meeting_chunk, translated_text)
-
-    def _emit_gemini_live_event(self, event: dict[str, Any], base_time_ms: int) -> None:
-        if self.config is None:
-            return
-        event_type = event.get("type", "")
-        trace_debug(
-            f"gemini_live event type={event_type} "
-            f"text={str(event.get('text', event.get('message', '')))[:80]!r}"
-        )
-        translate_enabled = is_translate_model_enabled(self.config.translate_model)
-        if event_type == "error":
-            emit({
-                "type": "error",
-                "mode": self.config.mode,
-                "sessionId": self.config.session_id,
-                "code": "gemini_live_translate_failed",
-                "message": str(event.get("message", "Gemini Live Translate failed")),
-                "recoverable": bool(event.get("recoverable", True)),
-            })
-            return
-        if self.gemini_live_stabilizer is None:
-            self.gemini_live_stabilizer = GeminiLiveCaptionStabilizer(self.config.partial_stable_ms)
-        if event_type == "turn_complete":
-            if self.gemini_live_stabilizer.has_pending(include_source=True):
-                self._emit_gemini_caption_event(self.gemini_live_stabilizer.flush(base_time_ms))
-            return
-        if event_type == "input_transcript":
-            source_hint = self._get_gemini_meeting_source_hint(base_time_ms) if self.config.mode == "meeting" else ""
-            for caption in self.gemini_live_stabilizer.add_source(
-                str(event.get("text", "")),
-                base_time_ms,
-                str(event.get("languageCode", "")),
-                emit_as_caption=not translate_enabled,
-                source_hint=source_hint,
-            ):
-                self._emit_gemini_caption_event(caption)
-            return
-        if event_type != "output_transcript":
-            return
-        if not translate_enabled:
-            return
-        source_hint = self._get_gemini_meeting_source_hint(base_time_ms) if self.config.mode == "meeting" else ""
-        captions = self.gemini_live_stabilizer.add_translation(
-            str(event.get("text", "")),
-            base_time_ms,
-            str(event.get("languageCode", "")),
-            source_hint=source_hint,
-        )
-        for caption in captions:
-            self._emit_gemini_caption_event(caption)
 
     def _stop_transcriber(self, transcriber: Any) -> None:
         if transcriber is None:
@@ -5490,82 +4834,11 @@ class SidecarApp:
             ):
                 self._feed_meeting_transcriber(source, incoming, transcriber, session_start_ms)
 
-    def _run_gemini_live_meeting_stream_loop(self) -> None:
-        emit({"type": "session_state", "state": "streaming", "detail": "Gemini Live Translate meeting streaming"})
-        assert self.config is not None
-        assert self.capture is not None
-        assert self.gemini_live is not None
-
-        session_start_ms = now_ms()
-        total_samples_fed = 0
-
-        while not self.stop_event.is_set():
-            time.sleep(0.025)
-            incoming_mic = self.capture.drain_primary() if self.config.meeting_source_mode in {"microphone", "dual"} else np.zeros(0, dtype=np.float32)
-            incoming_system = self.capture.drain_output() if self.config.meeting_source_mode == "dual" else np.zeros(0, dtype=np.float32)
-            if self.config.meeting_source_mode == "system-audio":
-                incoming_system = self.capture.drain_primary()
-
-            if self.config.meeting_source_mode == "dual":
-                pending_microphone = self.meeting_mix_pending_microphone
-                pending_system = self.meeting_mix_pending_system
-                if pending_microphone is None:
-                    pending_microphone = np.copy(incoming_mic[:0])
-                if pending_system is None:
-                    pending_system = np.copy(incoming_system[:0])
-                incoming_for_gemini, self.meeting_mix_pending_microphone, self.meeting_mix_pending_system = build_meeting_mix_chunk(
-                    pending_microphone,
-                    pending_system,
-                    incoming_mic,
-                    incoming_system,
-                )
-                if incoming_for_gemini.size > 0:
-                    self._append_meeting_audio("mix", incoming_for_gemini)
-            else:
-                self._append_meeting_audio("microphone", incoming_mic)
-                self._append_meeting_audio("system", incoming_system)
-                incoming_for_gemini = incoming_mic if self.config.meeting_source_mode == "microphone" else incoming_system
-
-            self._emit_metrics()
-
-            if incoming_for_gemini.size > 0:
-                base_time_ms = session_start_ms + int(total_samples_fed / SAMPLE_RATE * 1000)
-                total_samples_fed += incoming_for_gemini.size
-                if self.config.meeting_source_mode == "dual":
-                    self._record_gemini_meeting_source_level(
-                        base_time_ms,
-                        base_time_ms + int(incoming_for_gemini.size / SAMPLE_RATE * 1000),
-                        incoming_mic,
-                        incoming_system,
-                    )
-                self.gemini_live.feed_audio(incoming_for_gemini)
-            else:
-                base_time_ms = now_ms()
-
-            for event in self.gemini_live.poll_events():
-                self._emit_gemini_live_event(event, base_time_ms)
-
-            if self.gemini_live_stabilizer is not None:
-                for caption in self.gemini_live_stabilizer.drain_due(now_ms()):
-                    self._emit_gemini_caption_event(caption)
-
-        if self.config.meeting_source_mode == "dual":
-            self._flush_dual_meeting_audio()
-        for event in self.gemini_live.poll_events():
-            self._emit_gemini_live_event(event, now_ms())
-        if self.gemini_live_stabilizer is not None and self.gemini_live_stabilizer.has_pending():
-            self._emit_gemini_caption_event(self.gemini_live_stabilizer.flush(now_ms()))
 
     def _stream_loop(self) -> None:
         assert self.config is not None
-        if self.config.mode == "meeting" and self.config.stt_model == "gemini-live":
-            self._run_gemini_live_meeting_stream_loop()
-            return
         if self.config.mode == "meeting":
             self._run_meeting_stream_loop()
-            return
-        if self.config.mode == "subtitle" and self.config.translate_model == "gemini-live":
-            self._run_gemini_live_stream_loop()
             return
 
         emit({"type": "session_state", "state": "streaming"})
@@ -5603,38 +4876,6 @@ class SidecarApp:
             if inference_ms > 0:
                 self._emit_metrics(processing_lag_ms=inference_ms, force=True)
 
-    def _run_gemini_live_stream_loop(self) -> None:
-        emit({"type": "session_state", "state": "streaming", "detail": "Gemini Live Translate streaming"})
-        assert self.config is not None
-        assert self.capture is not None
-        assert self.gemini_live is not None
-
-        session_start_ms = now_ms()
-        total_samples_fed = 0
-
-        while not self.stop_event.is_set():
-            time.sleep(0.025)
-            incoming = self.capture.drain()
-            self._emit_metrics()
-
-            if incoming.size > 0:
-                base_time_ms = session_start_ms + int(total_samples_fed / SAMPLE_RATE * 1000)
-                total_samples_fed += incoming.size
-                self.gemini_live.feed_audio(incoming)
-            else:
-                base_time_ms = now_ms()
-
-            for event in self.gemini_live.poll_events():
-                self._emit_gemini_live_event(event, base_time_ms)
-
-            if self.gemini_live_stabilizer is not None:
-                for caption in self.gemini_live_stabilizer.drain_due(now_ms()):
-                    self._emit_gemini_caption_event(caption)
-
-        for event in self.gemini_live.poll_events():
-            self._emit_gemini_live_event(event, now_ms())
-        if self.gemini_live_stabilizer is not None and self.gemini_live_stabilizer.has_pending():
-            self._emit_gemini_caption_event(self.gemini_live_stabilizer.flush(now_ms()))
 
     def _translation_loop(self) -> None:
         while True:
@@ -5673,7 +4914,7 @@ class SidecarApp:
                 # so Apple STT (detected_lang="en") translates en→zh-TW
                 # even when config.source_lang is "zh" (default).
                 first_chunk = batch[0][0].chunk if isinstance(batch[0][0], MeetingChunk) else batch[0][0]
-                effective_source = first_chunk.detected_lang or config.source_lang
+                effective_source = "auto" if config.stt_model == "breeze-asr-25" else first_chunk.detected_lang or config.source_lang
                 if effective_source in {"", "auto"}:
                     effective_source = "auto"
                 texts = [(item[0].chunk if isinstance(item[0], MeetingChunk) else item[0]).source_text for item in batch]

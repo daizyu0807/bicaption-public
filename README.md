@@ -10,6 +10,15 @@ Realtime bilingual subtitles, meeting captions, and hold-to-talk dictation app f
 
 Captures system audio via macOS ScreenCaptureKit or microphone input, transcribes speech locally, shows bilingual subtitles in a transparent always-on-top overlay, supports meeting caption sessions with transcript/notes export, and provides hold-to-talk dictation for quick text input.
 
+### Version 0.1.11
+
+- Apple on-device translation replaces the free Google endpoint. Prepare the language packs from the setup dialog before using bilingual captions.
+- Breeze ASR 25 supports Chinese and English meeting captions with translation.
+- Setup is available from a compact dialog; permissions can be completed before one restart.
+- Caption preview is under floating-window appearance. Opening the app brings settings to the foreground.
+- Experimental SpeechAnalyzer and Gemini Live options have been removed.
+- Check for Updates opens the public Releases page for manual installation.
+
 ### Download
 
 Download the latest macOS package from [GitHub Releases](https://github.com/daizyu0807/bicaption-public/releases).

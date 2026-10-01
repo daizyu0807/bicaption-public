@@ -11,14 +11,14 @@ import {
 test('resolveSttModelForSourceLang keeps the user-picked engine for fixed languages', () => {
   assert.equal(resolveSttModelForSourceLang('en', 'sensevoice'), 'sensevoice');
   assert.equal(resolveSttModelForSourceLang('zh-TW', 'apple-stt'), 'apple-stt');
-  assert.equal(resolveSttModelForSourceLang('ja', 'gemini-live'), 'gemini-live');
+  assert.equal(resolveSttModelForSourceLang('ja', 'gemini-live'), 'apple-stt');
   assert.equal(resolveSttModelForSourceLang('ko', 'groq-whisper'), 'groq-whisper');
 });
 
 test('resolveSttModelForSourceLang only corrects the invalid auto + apple-stt combination', () => {
   assert.equal(resolveSttModelForSourceLang('auto', 'apple-stt'), 'sensevoice');
   assert.equal(resolveSttModelForSourceLang('auto', 'sensevoice'), 'sensevoice');
-  assert.equal(resolveSttModelForSourceLang('auto', 'gemini-live'), 'gemini-live');
+  assert.equal(resolveSttModelForSourceLang('auto', 'gemini-live'), 'sensevoice');
   assert.equal(resolveSttModelForSourceLang('auto', 'groq-whisper'), 'groq-whisper');
 });
 
@@ -47,11 +47,23 @@ test('resolveTargetLangForSourceLang leaves distinct or translation-off targets 
 });
 
 test('isTranslationEnabled reflects stt/translate model combinations', () => {
-  const base = { sttModel: 'apple-stt', translateModel: 'google', sourceLang: 'en', targetLang: 'zh-TW' };
+  const base = { sttModel: 'apple-stt', translateModel: 'apple-translation', sourceLang: 'en', targetLang: 'zh-TW' };
   assert.equal(isTranslationEnabled(base), true);
   assert.equal(isTranslationEnabled({ ...base, translateModel: 'disabled' }), false);
   assert.equal(isTranslationEnabled({ ...base, sttModel: 'gemini-live' }), true);
-  assert.equal(isTranslationEnabled({ ...base, translateModel: 'gemini-live' }), false);
   assert.equal(isTranslationEnabled({ ...base, targetLang: 'en' }), false);
   assert.equal(isTranslationEnabled({ ...base, sourceLang: 'auto', targetLang: 'zh-TW' }), true);
+});
+
+
+
+
+test('retired native engine migrates to SFSpeech or auto-capable local recognition', () => {
+  assert.equal(resolveSttModelForSourceLang('en', 'apple-speech-analyzer'), 'apple-stt');
+  assert.equal(resolveSttModelForSourceLang('auto', 'apple-speech-analyzer'), 'sensevoice');
+});
+
+test('retired Gemini live selection migrates to local recognition', () => {
+  assert.equal(resolveSttModelForSourceLang('en', 'gemini-live'), 'apple-stt');
+  assert.equal(resolveSttModelForSourceLang('auto', 'gemini-live'), 'sensevoice');
 });

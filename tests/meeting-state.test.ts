@@ -74,3 +74,22 @@ test('meeting reducer clears active session after stop ack', () => {
   assert.equal(stopped.activeSessionId, null);
   assert.equal(stopped.partial, null);
 });
+
+test('stopping preserves unfinished words for review and next meeting starts clean', () => {
+  const state = { ...initialMeetingViewState, activeSessionId: 'm1', sessionState: 'streaming', partial: { id: 'p1', sourceText: 'last unfinished words', startedAtMs: 10, isFinal: false } };
+  const stopped = reduceMeetingEvent(state, { type: 'session_stopped_ack', mode: 'meeting', sessionId: 'm1' });
+  assert.equal(stopped.entries[0]?.sourceText, 'last unfinished words');
+  assert.equal(stopped.entries[0]?.isFinal, false);
+  assert.equal(stopped.partial, null);
+  const next = reduceMeetingEvent(stopped, { type: 'session_state', mode: 'meeting', sessionId: 'm2', state: 'connecting' });
+  assert.equal(next.entries.length, 0);
+});
+
+test('a recovered translation clears its stale warning without hiding other errors', () => {
+  const active = { ...initialMeetingViewState, activeSessionId:'m', sessionState:'streaming' };
+  const failed = reduceMeetingEvent(active,{type:'error',mode:'meeting',sessionId:'m',code:'translation_failed',message:'temporary translation warning',recoverable:true});
+  const caption = {type:'meeting_caption' as const,mode:'meeting' as const,sessionId:'m',segmentId:'s',text:'Hello',translatedText:'你好',tsStartMs:1,tsEndMs:2};
+  assert.equal(reduceMeetingEvent(failed,caption).lastError,null);
+  const audioError = reduceMeetingEvent(active,{type:'error',mode:'meeting',sessionId:'m',code:'capture_failed',message:'audio problem',recoverable:true});
+  assert.equal(reduceMeetingEvent(audioError,caption).lastError,'audio problem');
+});

@@ -12,6 +12,7 @@ export interface CaptionViewState {
     queueDepth: number;
   };
   lastError: string | null;
+  translationError: string | null;
 }
 
 export const initialViewState: CaptionViewState = {
@@ -25,6 +26,7 @@ export const initialViewState: CaptionViewState = {
     queueDepth: 0,
   },
   lastError: null,
+  translationError: null,
 };
 
 const DUPLICATE_HISTORY_WINDOW = 6;
@@ -113,14 +115,12 @@ export function reduceSidecarEvent(state: CaptionViewState, event: SidecarEvent)
       // any existing translation so subtitles don't flicker between the
       // initial emit and the translation-worker emit.
       const existing = state.captions.find((c) => c.segmentId === event.segmentId);
-      const translatedText = trimRepeatedHistoryTail(
-        event.translatedText || existing?.translatedText || '',
-        priorCaptions,
-        (caption) => caption.translatedText,
-      ) || existing?.translatedText || '';
+      const translation = event.translatedText || existing?.translatedText || '';
+      const translatedText = trimRepeatedHistoryTail(translation, priorCaptions, (caption) => caption.translatedText) || existing?.translatedText || '';
       return {
         ...state,
         partial: state.partial?.segmentId === event.segmentId ? null : state.partial,
+        translationError: event.translatedText ? null : state.translationError,
         captions: [
           ...priorCaptions,
           {
@@ -155,6 +155,7 @@ export function reduceSidecarEvent(state: CaptionViewState, event: SidecarEvent)
           activeSessionId: event.sessionId,
           sessionState: event.state,
           lastError: null,
+          translationError: null,
         };
       }
       if (state.activeSessionId && event.sessionId !== state.activeSessionId) {
@@ -177,6 +178,7 @@ export function reduceSidecarEvent(state: CaptionViewState, event: SidecarEvent)
       return {
         ...state,
         lastError: event.message,
+        translationError: event.code === 'translation_failed' ? event.message : state.translationError,
         sessionState: event.recoverable ? state.sessionState : 'error',
       };
     default:

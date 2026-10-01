@@ -1,3 +1,6 @@
+import { shouldRenderSubtitleOverlay, getSubtitlePreview, type OverlayMode } from './overlay-preview.js';
+import { createSettingsSaveQueue, type SettingsSaveQueue, type SettingsSaveStatus } from './settings-save-queue.js';
+import { SetupPanel } from './SetupPanel.js';
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   AppSettings,
@@ -45,7 +48,7 @@ function OverlayView({
   viewState: ReturnType<typeof useCaptionState>;
   dictationState: ReturnType<typeof useDictationState>;
   settings: AppSettings;
-  overlayMode: 'hidden' | 'subtitle' | 'dictation';
+  overlayMode: OverlayMode;
 }) {
   const overlayStyle = applySettingsOverlayStyle(settings);
   const hasVisibleCaptions = viewState.captions.length > 0 || Boolean(viewState.partial);
@@ -53,9 +56,7 @@ function OverlayView({
     || ['recording', 'capturing', 'processing'].includes(dictationState.dictationState);
   const [showDictationResult, setShowDictationResult] = useState(false);
   const shouldShowDictationPrompt = isDictationActive || showDictationResult;
-  const shouldShowShell = hasVisibleCaptions
-    || viewState.sessionState === 'streaming'
-    || viewState.sessionState === 'connecting'
+  const shouldShowShell = shouldRenderSubtitleOverlay(overlayMode, viewState.sessionState, hasVisibleCaptions)
     || shouldShowDictationPrompt
     || overlayMode === 'dictation';
   const translationEnabled = isTranslationEnabled(settings);
@@ -73,6 +74,8 @@ function OverlayView({
     }
     : dictationPrompt;
   const isDictationOverlayMode = overlayMode === 'dictation';
+  const isPreview = overlayMode === 'preview';
+  const preview = getSubtitlePreview(settings.sourceLang, settings.targetLang);
 
   useEffect(() => {
     function isNearBottom() {
@@ -242,7 +245,7 @@ function OverlayView({
             <span aria-hidden="true">×</span>
           </button>
         </div>
-        <span className="overlay-title">{isDictationOverlayMode ? '語音輸入' : 'BiCaption'}</span>
+        <span className="overlay-title">{isDictationOverlayMode ? '語音輸入' : isPreview ? '字幕預覽' : 'BiCaption'}</span>
         {!isDictationOverlayMode && !isFollowingLatest ? (
           <button className="overlay-follow-button no-drag" onClick={scrollOverlayToLatest}>
             回到最新
@@ -273,7 +276,7 @@ function OverlayView({
               </div>
             </div>
           )}
-          {!isDictationOverlayMode ? viewState.captions.map((caption) => (
+          {!isDictationOverlayMode && !isPreview ? viewState.captions.map((caption) => (
             <div key={caption.segmentId} className="caption-pair no-drag">
               <p className="caption-line">{caption.sourceText}</p>
               {translationEnabled && caption.translatedText ? (
@@ -281,10 +284,18 @@ function OverlayView({
               ) : null}
             </div>
           )) : null}
-          {!isDictationOverlayMode && viewState.partial ? (
+          {!isDictationOverlayMode && !isPreview && viewState.partial ? (
             <p className="caption-line caption-partial no-drag">{viewState.partial.sourceText}</p>
           ) : null}
-          {!isDictationOverlayMode && !hasVisibleCaptions ? (
+          {!isDictationOverlayMode && !isPreview && translationEnabled && viewState.translationError ? (
+            <p className="caption-line caption-hint no-drag" role="status">{viewState.translationError}</p>
+          ) : null}
+          {isPreview && <div className="caption-pair no-drag">
+            <p className="caption-line">{preview.sourceText}</p>
+            {translationEnabled && <p className="caption-line caption-translation">{preview.translatedText}</p>}
+            <p className="caption-line caption-hint">預覽示例・未啟動收音</p>
+          </div>}
+          {!isDictationOverlayMode && !isPreview && !hasVisibleCaptions ? (
             <>
               <p className="caption-line caption-hint no-drag">Listening for speech...</p>
               <p className="caption-line caption-hint no-drag">Confirm input level is active, then captions appear here.</p>
@@ -360,16 +371,22 @@ function useDictationState() {
 }
 
 function useOverlayMode() {
-  const [mode, setMode] = useState<'hidden' | 'subtitle' | 'dictation'>('hidden');
+  const [mode, setMode] = useState<OverlayMode>('hidden');
 
   useEffect(() => {
     if (!window.app) {
       return;
     }
 
-    return window.app.subscribe('overlay:mode', (payload) => {
-      setMode(payload.mode);
+    let active = true;
+    let receivedEvent = false;
+    const unsubscribe = window.app.subscribe('overlay:mode', (payload) => {
+      receivedEvent = true; setMode(payload.mode);
     });
+    if (typeof window.app.getOverlayMode === 'function') void window.app.getOverlayMode().then(payload => {
+      if (active && !receivedEvent) setMode(payload.mode);
+    }).catch(() => {});
+    return () => { active = false; unsubscribe(); };
   }, []);
 
   return mode;
@@ -452,11 +469,7 @@ function isMeetingTranslationEnabled(settings: AppSettings): boolean {
 function buildSessionConfig(settings: AppSettings, mode: SessionMode = 'subtitle'): CaptionConfig {
   const isDictation = mode === 'dictation';
   const isMeeting = mode === 'meeting';
-  const subtitleTranslateModel = settings.sttModel === 'gemini-live'
-    ? 'gemini-live'
-    : settings.translateModel === 'gemini-live'
-      ? 'google'
-      : settings.translateModel;
+  const subtitleTranslateModel = settings.translateModel;
   const meetingPrimaryDeviceId = settings.meetingSourceMode === 'system-audio'
     ? settings.meetingSystemAudioDeviceId
     : settings.meetingMicDeviceId;
@@ -486,7 +499,6 @@ function buildSessionConfig(settings: AppSettings, mode: SessionMode = 'subtitle
     dictationProperNounCorrectionEnabled: isDictation ? false : undefined,
     dictationPersonalGlossary: undefined,
     dictationCloudApiKey: settings.dictationCloudApiKey,
-    geminiApiKey: settings.geminiApiKey,
     dictationCloudModel: settings.dictationCloudModel,
     dictationCloudLlmPrompt: isDictation ? settings.dictationCloudLlmPrompt : undefined,
     dictationMaxRewriteExpansionRatio: isDictation ? settings.dictationMaxRewriteExpansionRatio : undefined,
@@ -578,7 +590,6 @@ const MODEL_LIBRARY = [
 ] as const;
 
 const ASR_MODEL_OPTIONS = [
-  { key: 'gemini-live', label: 'Gemini 3.5 Live Translate', note: '雲端即時 STT + 翻譯' },
   { key: 'groq-whisper', label: 'Groq Whisper', note: '線上高準確 / 需網路' },
   { key: 'breeze-asr-25', label: 'Breeze ASR 25 精準辨識', note: '本地分段 / 台灣中文與混語' },
   { key: 'apple-stt', label: 'SFSpeechRecognizer', note: '本地快速' },
@@ -586,7 +597,7 @@ const ASR_MODEL_OPTIONS = [
 ] as const;
 
 const SUBTITLE_ASR_MODEL_OPTIONS = ASR_MODEL_OPTIONS.filter((option) =>
-  option.key === 'apple-stt' || option.key === 'sensevoice' || option.key === 'gemini-live');
+  option.key === 'apple-stt' || option.key === 'sensevoice');
 
 type AppGlyphName =
   | 'subtitle'
@@ -755,9 +766,6 @@ function getAsrOptionsForMode(mode: SessionMode) {
 }
 
 function isAsrModelUnavailableInMode(modelKey: string, mode: SessionMode) {
-  if (modelKey === 'gemini-live') {
-    return mode !== 'subtitle' && mode !== 'meeting';
-  }
   if (modelKey === 'breeze-asr-25') {
     return mode === 'subtitle';
   }
@@ -792,7 +800,6 @@ function getDictationOutputActionLabel(action: DictationOutputAction) {
 
 function isSessionModelReady(status: ModelStatus | null, modelKey: string) {
   const modelReadyMap: Record<string, boolean> = {
-    'gemini-live': true,
     'groq-whisper': true,
     'breeze-asr-25': status?.breezeAsr ?? false,
     sensevoice: status?.sensevoice ?? false,
@@ -910,7 +917,40 @@ function SettingsView({
   onSave: (partial: Partial<AppSettings>) => Promise<void>;
 }) {
   const [activeSettingsTab, setActiveSettingsTab] = useState<'subtitle' | 'dictation' | 'meeting' | 'models'>('subtitle');
-  const [draft, setDraft] = useState(settings);
+  const [draft, updateDraft] = useState(settings);
+  const [saveStatus, setSaveStatus] = useState<SettingsSaveStatus>('saved');
+  const saveQueueRef = useRef<SettingsSaveQueue<AppSettings> | null>(null);
+  const onSaveRef = useRef(onSave);
+  onSaveRef.current = onSave;
+  const initialSettingsRef = useRef(settings);
+  function setDraft(next: AppSettings) {
+    saveQueueRef.current?.edit(next);
+    updateDraft(next);
+    setMeetingApplyNotice(null);
+  }
+  async function savePreferences() {
+    await saveQueueRef.current?.flush();
+  }
+  const [showSetup, setShowSetup] = useState(false);
+  const setupDialogRef = useRef<HTMLDialogElement | null>(null);
+  const setupPromptedRef = useRef(false);
+  const handleSetupPermissions = useCallback((ready: boolean) => {
+    try {
+      if (ready) localStorage.setItem('bicaption.setup.completed', '1');
+      else if (!setupPromptedRef.current && !localStorage.getItem('bicaption.setup.completed') && !localStorage.getItem('bicaption.setup.dismissed')) {
+        setupPromptedRef.current = true; setShowSetup(true);
+      }
+    } catch { /* Storage unavailable: manual setup remains accessible. */ }
+  }, []);
+  function closeSetup() {
+    try { localStorage.setItem('bicaption.setup.dismissed', '1'); } catch { /* optional preference */ }
+    setShowSetup(false);
+  }
+  useEffect(() => {
+    const dialog = setupDialogRef.current;
+    if (showSetup && dialog && !dialog.open) dialog.showModal();
+    else if (!showSetup && dialog?.open) dialog.close();
+  }, [showSetup]);
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
   const inputDevices = devices.filter((d) => d.kind === 'input' || d.kind === 'duplex');
   const loopbackDevices = devices.filter((d) => d.kind === 'duplex');
@@ -921,6 +961,9 @@ function SettingsView({
   const [inputMonitoringPermission, setInputMonitoringPermission] = useState<{ trusted: boolean; available: boolean; detail?: string } | null>(null);
   const [screenRecordingPermission, setScreenRecordingPermission] = useState<{ granted: boolean; detail?: string } | null>(null);
   const [hotkeyTestError, setHotkeyTestError] = useState<string | null>(null);
+  const [meetingActionError, setMeetingActionError] = useState<string | null>(null);
+  const [meetingActionPending, setMeetingActionPending] = useState(false);
+  const [meetingApplyNotice, setMeetingApplyNotice] = useState<string | null>(null);
   const [subtitleActionError, setSubtitleActionError] = useState<string | null>(null);
   const [dictationPermissionReadyToRestart, setDictationPermissionReadyToRestart] = useState(false);
   const dictationPermissionFlowActiveRef = useRef(false);
@@ -1032,19 +1075,25 @@ function SettingsView({
     meetingViewState.clearEntries();
     setMeetingCopilotInsights(null);
     setMeetingCopilotError(null);
+    setMeetingActionError(null);
   }
 
   async function handleMeetingEnd() {
-    if (isMeetingStreaming) {
+    setMeetingActionPending(true);
+    setMeetingActionError(null);
+    try {
       await window.app.stopSession();
+    } catch (error) {
+      setMeetingActionError(error instanceof Error ? error.message : '停止會議失敗，逐字稿仍保留。');
+    } finally {
+      setMeetingActionPending(false);
     }
-    resetMeetingWorkspace();
   }
 
-  function buildMeetingCopilotTranscript() {
+  function buildMeetingCopilotTranscript(includeTranslations = false) {
     const finalLines = meetingTurns.map((turn) => {
       const speakerLabel = getMeetingSpeakerLabel(draft, turn.speakerKind, turn.source, turn.speakerLabel);
-      return `[${formatMeetingTimestamp(turn.startedAtMs ?? turn.endedAtMs)}] ${speakerLabel}: ${turn.sourceText}`;
+      return `[${formatMeetingTimestamp(turn.startedAtMs ?? turn.endedAtMs)}${turn.isFinal ? '' : ' / 未定稿'}] ${speakerLabel}: ${turn.sourceText}${includeTranslations && turn.translatedText ? `\n${turn.translatedText}` : ''}`;
     });
     if (meetingViewState.partial?.sourceText) {
       const speakerLabel = getMeetingSpeakerLabel(
@@ -1251,36 +1300,21 @@ function SettingsView({
   }, [activeSettingsTab, needsDictationPermission]);
 
   useEffect(() => {
-    setDraft(settings);
-  }, [settings]);
+    const queue = createSettingsSaveQueue(initialSettingsRef.current,
+      (patch) => onSaveRef.current(patch),
+      (status, error) => {
+        setSaveStatus(status);
+        setIsDictationAutosaving(status === 'saving' || status === 'pending');
+        setDictationAutosaveError(error ?? null);
+      });
+    saveQueueRef.current = queue;
+    return () => { queue.dispose(); saveQueueRef.current = null; };
+  }, []);
 
   useEffect(() => {
-    if (!['dictation', 'models'].includes(activeSettingsTab)) {
-      return;
-    }
-    const draftSnapshot = JSON.stringify(draft);
-    const settingsSnapshot = JSON.stringify(settings);
-    if (draftSnapshot === settingsSnapshot) {
-      setIsDictationAutosaving(false);
-      return;
-    }
-
-    setIsDictationAutosaving(true);
-    const timeoutId = window.setTimeout(() => {
-      onSave(draft)
-        .then(() => {
-          setDictationAutosaveError(null);
-        })
-        .catch((error: unknown) => {
-          setDictationAutosaveError(error instanceof Error ? error.message : 'Failed to save dictation settings');
-        })
-        .finally(() => {
-          setIsDictationAutosaving(false);
-        });
-    }, 250);
-
-    return () => window.clearTimeout(timeoutId);
-  }, [activeSettingsTab, draft, onSave, settings]);
+    const merged = saveQueueRef.current?.receive(settings) ?? settings;
+    updateDraft({ ...merged });
+  }, [settings]);
 
   function toggleHotkeyModifier(modifier: string, checked: boolean) {
     const modifiers = checked
@@ -1368,15 +1402,8 @@ function SettingsView({
             <p className="va-description">{activeTabMeta.description}</p>
           </div>
           <div className="va-header-actions">
-            {activeSettingsTab === 'subtitle' ? (
-              <button
-                className="button-secondary va-button-secondary"
-                type="button"
-                onClick={() => window.app.showOverlay()}
-              >
-                預覽字幕視窗
-              </button>
-            ) : null}
+            <button className="button-secondary" onClick={() => setShowSetup(true)}>使用準備</button>
+
             <div className="va-top-pill">
               <span className="va-top-pill-check" aria-hidden="true">✓</span>
               <span>{topStatusLabel}</span>
@@ -1384,6 +1411,17 @@ function SettingsView({
           </div>
         </header>
 
+        <dialog className="setup-dialog" ref={setupDialogRef} aria-label="使用準備" onCancel={closeSetup}>
+        <SetupPanel
+          onClose={closeSetup}
+          onPermissionsResolved={handleSetupPermissions}
+          sttModel={activeSettingsTab === 'meeting' ? draft.meetingSttModel : draft.sttModel}
+          source={activeSettingsTab === 'meeting' ? draft.meetingSourceLang : draft.sourceLang}
+          target={activeSettingsTab === 'meeting' ? draft.meetingTargetLang : draft.targetLang}
+          translationEnabled={(activeSettingsTab === 'meeting' ? draft.meetingTranslateModel : draft.translateModel) === 'apple-translation'}
+          needsSpeech={[draft.sttModel, draft.meetingSttModel, draft.dictationSttModel].includes('apple-stt')}
+        />
+        </dialog>
         <div className={`va-content va-content-${activeSettingsTab}`}>
         {activeSettingsTab === 'dictation' && (
         <div className="va-grid-panel va-grid-panel-dictation">
@@ -1471,54 +1509,7 @@ function SettingsView({
                   ))}
                 </div>
               </div>
-              {showDictationPermissionCard && (
-                <div className="bc-inline-permission">
-                  <div className="bc-permission-header">
-                    <span className="bc-permission-shield" aria-hidden="true">✓</span>
-                    <div className="bc-inline-permission-copy">
-                      <strong>完成語音輸入設定</strong>
-                      <p>依序完成兩項權限，最後只需重新開啟一次。</p>
-                    </div>
-                  </div>
-                  <div className="bc-permission-progress">
-                    <div className={accessibilityPermissionGranted ? 'bc-permission-step complete' : 'bc-permission-step current'}>
-                      <span className="bc-permission-step-marker" aria-hidden="true">{accessibilityPermissionGranted ? '✓' : '1'}</span>
-                      <div className="bc-permission-step-copy">
-                        <strong>輔助使用</strong>
-                        <span>允許自動貼上辨識結果</span>
-                      </div>
-                      <span className={accessibilityPermissionGranted ? 'bc-permission-status complete' : 'bc-permission-status pending'}>
-                        {accessibilityPermissionGranted ? '已允許' : '待完成'}
-                      </span>
-                    </div>
-                    <div className={inputMonitoringPermissionGranted ? 'bc-permission-step complete' : accessibilityPermissionGranted ? 'bc-permission-step current' : 'bc-permission-step'}>
-                      <span className="bc-permission-step-marker" aria-hidden="true">{inputMonitoringPermissionGranted ? '✓' : '2'}</span>
-                      <div className="bc-permission-step-copy">
-                        <strong>輸入監控</strong>
-                        <span>允許全域快捷鍵在背景運作</span>
-                      </div>
-                      <span className={inputMonitoringPermissionGranted ? 'bc-permission-status complete' : 'bc-permission-status pending'}>
-                        {inputMonitoringPermissionGranted ? '已允許' : '待完成'}
-                      </span>
-                    </div>
-                  </div>
-                  <div className="bc-inline-permission-actions">
-                    {needsDictationPermission ? (
-                      <button className="button-primary bc-permission-primary" onClick={requestDictationPermissions}>
-                        {!accessibilityPermissionGranted ? '授權輔助使用' : '授權輸入監控'}
-                      </button>
-                    ) : null}
-                    {dictationPermissionReadyToRestart ? (
-                      <button className="button-primary bc-permission-primary" onClick={async () => { await window.app.relaunchApp(); }}>
-                        完成授權並重新開啟
-                      </button>
-                    ) : null}
-                    <p className="bc-permission-footnote">
-                      {dictationPermissionReadyToRestart ? '兩項權限已完成，重新開啟後即可使用。' : '兩項皆完成後即可重新開啟 BiCaption。'}
-                    </p>
-                  </div>
-                </div>
-              )}
+              {showDictationPermissionCard && <p className="model-hint">從「使用準備」完成權限，最後統一重新開啟。</p>}
               {hotkeyValidation.error ? <p className="error-text">{hotkeyValidation.error}</p> : null}
               {!hotkeyValidation.error && hotkeyValidation.warning ? <p className="model-hint">{hotkeyValidation.warning}</p> : null}
               {hotkeyTestError ? <p className="error-text">{hotkeyTestError}</p> : null}
@@ -1752,10 +1743,9 @@ function SettingsView({
                   <input
                     type="checkbox"
                     checked={translationOn}
-                    disabled={draft.sttModel === 'gemini-live'}
                     onChange={(event) => setDraft({
                       ...draft,
-                      translateModel: event.target.checked ? 'google' : 'disabled',
+                      translateModel: event.target.checked ? 'apple-translation' : 'disabled',
                       targetLang: event.target.checked
                         ? (draft.targetLang === draft.sourceLang
                           ? getDefaultSubtitleTargetLang(draft.sourceLang)
@@ -1829,12 +1819,7 @@ function SettingsView({
                         className="secondary"
                         onClick={async () => {
                           setSubtitleActionError(null);
-                          const result = await window.app.requestScreenRecordingPermission();
-                          setScreenRecordingPermission(result);
-                          if (!result.granted) {
-                            setSubtitleActionError(result.detail ?? '完成授權後切回 BiCaption，系統會重新檢查。');
-                            await window.app.openScreenRecordingSettings();
-                          }
+                          setShowSetup(true);
                         }}
                       >
                         授權
@@ -1882,6 +1867,19 @@ function SettingsView({
                     <span>{draft.partialStableMs}ms</span>
                   </div>
                 </div>
+                <div className="bc-inline-permission-actions">
+              <button
+                className="button-secondary va-button-secondary"
+                type="button"
+                onClick={async () => {
+                  setSubtitleActionError(null);
+                  try { await savePreferences(); await window.app.showOverlay(); }
+                  catch (error) { setSubtitleActionError(error instanceof Error ? error.message : '無法開啟字幕預覽'); }
+                }}
+              >
+                預覽字幕視窗
+              </button>
+                </div>
               </div>
             </article>
 
@@ -1899,9 +1897,7 @@ function SettingsView({
                         ? 'Apple STT：本地、最快，固定語言優先。'
                         : draft.sttModel === 'sensevoice'
                           ? 'SenseVoice：本地多語，可處理混語場景。'
-                          : draft.sttModel === 'gemini-live'
-                            ? 'Gemini Live Translate：雲端即時收音、辨識並翻譯，需網路。'
-                            : 'Groq Whisper：雲端高品質，需網路。'}
+                          : 'Groq Whisper：雲端高品質，需網路。'}
                     </p>
                   </div>
                   <select
@@ -1911,11 +1907,7 @@ function SettingsView({
                       setDraft({
                         ...draft,
                         sttModel: nextModel,
-                        translateModel: nextModel === 'gemini-live'
-                          ? 'gemini-live'
-                          : draft.translateModel === 'gemini-live'
-                            ? 'google'
-                            : draft.translateModel,
+                        translateModel: draft.translateModel,
                       });
                     }}
                   >
@@ -1940,22 +1932,7 @@ function SettingsView({
                     <p className="model-hint">Groq Whisper 會把字幕音訊送到雲端做語音辨識；翻譯仍維持你目前的翻譯引擎設定。</p>
                   </div>
                 )}
-                {draft.sttModel === 'gemini-live' && (
-                  <div className="bc-inline-field">
-                    <label className="settings-label">
-                      <span>Gemini API Key</span>
-                      <input
-                        type="password"
-                        value={draft.geminiApiKey}
-                        onChange={(event) => setDraft({ ...draft, geminiApiKey: event.target.value })}
-                        placeholder="AIza..."
-                        autoComplete="off"
-                        spellCheck={false}
-                      />
-                    </label>
-                    <p className="model-hint">Gemini Live Translate 會把字幕音訊送到 Gemini 雲端做即時 STT 與翻譯。</p>
-                  </div>
-                )}
+
               </div>
             </article>
 
@@ -2086,15 +2063,24 @@ function SettingsView({
                       : meetingViewState.sessionState === 'connecting'
                         ? '正在準備收音'
                         : hasMeetingTranscript
-                          ? '本次逐字稿已停止'
+                          ? '會議已停止，逐字稿保留於此；可複製或匯出'
                           : '尚未開始會議字幕'}
                   </span>
                 </div>
                 <div className="va-meeting-feature-actions">
+                  <button className="button-secondary" disabled={!hasMeetingTranscript} onClick={async () => {
+                    try { await navigator.clipboard.writeText(buildMeetingCopilotTranscript(true)); setMeetingActionError(null); }
+                    catch { setMeetingActionError('複製失敗，請改用匯出逐字稿。'); }
+                  }}>複製</button>
+                  <button className="button-secondary" disabled={!hasMeetingTranscript} onClick={() => {
+                    const url = URL.createObjectURL(new Blob([buildMeetingCopilotTranscript(true)], { type: 'text/plain;charset=utf-8' }));
+                    const link = document.createElement('a'); link.href = url; link.download = 'meeting-transcript.txt';
+                    link.click(); window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+                  }}>匯出逐字稿</button>
                   <button
                     className="button-secondary"
                     type="button"
-                    disabled={!hasMeetingTranscript}
+                    disabled={!hasMeetingTranscript || isMeetingStreaming || meetingActionPending}
                     onClick={resetMeetingWorkspace}
                   >
                     清空
@@ -2102,13 +2088,15 @@ function SettingsView({
                   <button
                     className="button-danger"
                     type="button"
-                    disabled={!hasMeetingTranscript && !isMeetingStreaming}
+                    disabled={!isMeetingStreaming || meetingActionPending}
                     onClick={handleMeetingEnd}
                   >
-                    結束
+                    {meetingActionPending ? '正在結束…' : '結束'}
                   </button>
                 </div>
               </div>
+              {meetingActionError && <p className="error-text" role="alert">{meetingActionError}</p>}
+              {meetingViewState.lastError && <p className="error-text" role="alert">{meetingViewState.lastError}</p>}
             </article>
 
             <article className="va-card va-card-bodyless va-meeting-copilot-card">
@@ -2310,7 +2298,7 @@ function SettingsView({
                       onChange={(event) => setDraft({
                         ...draft,
                         meetingTranslateModel: event.target.checked
-                          ? (draft.meetingSttModel === 'gemini-live' ? 'gemini-live' : 'google')
+                          ? 'apple-translation'
                           : 'disabled',
                       })}
                     />
@@ -2326,12 +2314,7 @@ function SettingsView({
                     <div className="bc-inline-permission-actions">
                       <button className="secondary" onClick={async () => {
                         setSubtitleActionError(null);
-                        const result = await window.app.requestScreenRecordingPermission();
-                        setScreenRecordingPermission(result);
-                        if (!result.granted) {
-                          setSubtitleActionError(result.detail ?? '完成授權後切回 BiCaption，系統會重新檢查。');
-                          await window.app.openScreenRecordingSettings();
-                        }
+                        setShowSetup(true);
                       }}>
                         授權
                       </button>
@@ -2379,10 +2362,9 @@ function SettingsView({
                 <div className="va-row">
                   <div className="va-row-copy">
                     <strong>語音辨識引擎</strong>
-                    {draft.meetingSttModel === 'apple-stt' ? <p>Apple STT 不支援多語自動判斷。</p> : null}
+                    {!sttModelSupportsAutoDetect(draft.meetingSttModel) ? <p>Apple STT 不支援多語自動判斷。</p> : null}
                     {draft.meetingSttModel === 'sensevoice' ? <p>SenseVoice 適合多人交替說話情境。</p> : null}
                     {draft.meetingSttModel === 'breeze-asr-25' ? <p>Breeze 會在偵測到說話停頓後辨識該段，適合台灣中文與中英混說；不提供連續 partial 字幕。</p> : null}
-                    {draft.meetingSttModel === 'gemini-live' ? <p>Gemini Live 走雲端多語辨識與即時翻譯；dual source 會先以混音送出，不取代既有本地說話者分流。</p> : null}
                   </div>
                   <select
                     value={draft.meetingSttModel}
@@ -2391,11 +2373,7 @@ function SettingsView({
                       setDraft({
                         ...draft,
                         meetingSttModel: nextModel,
-                        meetingTranslateModel: nextModel === 'gemini-live'
-                          ? 'gemini-live'
-                          : draft.meetingTranslateModel === 'gemini-live'
-                            ? 'google'
-                            : draft.meetingTranslateModel,
+                        meetingTranslateModel: draft.meetingTranslateModel,
                       });
                     }}
                     disabled={isMeetingStreaming}
@@ -2405,22 +2383,7 @@ function SettingsView({
                     ))}
                   </select>
                 </div>
-                {draft.meetingSttModel === 'gemini-live' && (
-                  <div className="bc-inline-field">
-                    <label className="settings-label">
-                      <span>Gemini API Key</span>
-                      <input
-                        type="password"
-                        value={draft.geminiApiKey}
-                        onChange={(event) => setDraft({ ...draft, geminiApiKey: event.target.value })}
-                        placeholder="AIza..."
-                        autoComplete="off"
-                        spellCheck={false}
-                      />
-                    </label>
-                    <p className="model-hint">同一組 key 會用於 Gemini Live 字幕與會議模式；也可由本機 .env 提供。</p>
-                  </div>
-                )}
+
               </div>
             </article>
           </div>
@@ -2479,7 +2442,7 @@ function SettingsView({
           <article className="va-card va-card-bodyless">
             <div className="bc-card-header">
               <h3 className="bc-card-title">雲端模型憑證</h3>
-              <p className="bc-card-hint">管理線上 STT、雲端文字整理與 Gemini Live Translate 憑證。</p>
+              <p className="bc-card-hint">管理線上 STT 與雲端文字整理憑證。</p>
             </div>
             <div className="bc-card-body">
               <div className="va-stack-row">
@@ -2495,21 +2458,7 @@ function SettingsView({
                   spellCheck={false}
                 />
               </div>
-              <div className="va-divider" />
-              <div className="va-stack-row">
-                <div className="va-row-copy">
-                  <strong>Gemini API Key</strong>
-                  <p>用於 Gemini 3.5 Live Translate。</p>
-                </div>
-                <input
-                  type="password"
-                  value={draft.geminiApiKey}
-                  onChange={(event) => setDraft({ ...draft, geminiApiKey: event.target.value })}
-                  placeholder="AIza..."
-                  autoComplete="off"
-                  spellCheck={false}
-                />
-              </div>
+
             </div>
           </article>
         </div>
@@ -2518,7 +2467,9 @@ function SettingsView({
         <footer className="va-footer">
         <div className="va-footer-meta">
           <span className="va-footer-spark" aria-hidden="true">✦</span>
-          <span>{activeSettingsTab === 'dictation' && isDictationAutosaving ? '設定儲存中' : '設定會自動儲存'}</span>
+          <span role="status">{saveStatus === 'pending' ? '設定等待儲存…' : saveStatus === 'saving' ? '設定儲存中…' : saveStatus === 'error' ? '設定儲存失敗' : '偏好設定已保存'}{activeSettingsTab === 'subtitle' || activeSettingsTab === 'meeting' ? '；收音與辨識設定於下次開始生效' : ''}</span>
+          {dictationAutosaveError && <span className="error-text" role="alert">{dictationAutosaveError}</span>}
+          {saveStatus === 'error' && <button className="button-secondary" onClick={() => { void savePreferences().catch(() => {}); }}>重試保存</button>}
         </div>
         <div className="va-footer-actions">
         {activeSettingsTab === 'subtitle' ? (
@@ -2528,12 +2479,12 @@ function SettingsView({
             </button>
             <button
               className="button-primary button-session-action"
-              disabled={!modelsReady || !hotkeyValidation.isValid || isSubtitleStreaming}
+              disabled={!modelsReady || isSubtitleStreaming}
               onClick={async () => {
                 setSubtitleActionError(null);
                 try {
                   const nextSettings = { ...draft };
-                  await onSave(nextSettings);
+                  await savePreferences();
                   await window.app.startSession(buildSessionConfig(nextSettings));
                 } catch (error) {
                   setSubtitleActionError(error instanceof Error ? error.message : 'Failed to start subtitle session');
@@ -2561,17 +2512,19 @@ function SettingsView({
           <>
             <button
               className="button-secondary button-session-action"
-              disabled={!isMeetingStreaming}
-              onClick={() => window.app.stopSession()}
+              disabled={!isMeetingStreaming || meetingActionPending}
+              onClick={handleMeetingEnd}
             >
               停止
             </button>
             <button
               className="button-secondary button-session-action"
-              disabled={!isMeetingStreaming}
+              disabled={!isMeetingStreaming || meetingActionPending}
               onClick={async () => {
+                setMeetingActionPending(true); setMeetingActionError(null); setMeetingApplyNotice(null);
+                try {
                 const nextSettings = { ...draft };
-                await onSave(nextSettings);
+                await savePreferences();
                 await window.app.updateSession({
                   mode: 'meeting',
                   sourceLang: nextSettings.meetingSourceLang,
@@ -2580,21 +2533,30 @@ function SettingsView({
                   partialStableMs: nextSettings.meetingPartialStableMs,
                   meetingSpeakerLabelsEnabled: nextSettings.meetingSpeakerLabelsEnabled,
                 });
+                setMeetingApplyNotice('語言、翻譯、斷句與講者標籤已套用目前會議；收音與辨識模型於下次開始生效。');
+                } catch (error) { setMeetingActionError(error instanceof Error ? error.message : '套用會議設定失敗'); }
+                finally { setMeetingActionPending(false); }
               }}
             >
-              套用
+              套用目前會議
             </button>
             <button
               className="button-primary button-session-action"
-              disabled={!meetingModelsReady || isMeetingStreaming}
+              disabled={!meetingModelsReady || isMeetingStreaming || meetingActionPending}
               onClick={async () => {
-                const nextSettings = { ...draft };
-                await onSave(nextSettings);
-                await window.app.startSession(buildSessionConfig(nextSettings, 'meeting'));
+                setMeetingActionPending(true); setMeetingActionError(null); setMeetingApplyNotice(null);
+                try {
+                  const nextSettings = { ...draft };
+                  await savePreferences();
+                  await window.app.startSession(buildSessionConfig(nextSettings, 'meeting'));
+                  setMeetingCopilotInsights(null); setMeetingCopilotError(null);
+                } catch (error) { setMeetingActionError(error instanceof Error ? error.message : '開始會議失敗'); }
+                finally { setMeetingActionPending(false); }
               }}
             >
-              {!meetingModelsReady ? '需要下載模型' : '開始會議'}
+              {!meetingModelsReady ? '需要下載模型' : meetingActionPending ? '處理中…' : '開始會議'}
             </button>
+            {meetingApplyNotice && <p className="model-hint" role="status">{meetingApplyNotice}</p>}
           </>
         ) : activeSettingsTab === 'dictation' ? (
           <>

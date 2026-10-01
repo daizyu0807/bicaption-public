@@ -1,4 +1,5 @@
 import Store from 'electron-store';
+import { migrateRetiredSttModel } from './stt-model-migration.js';
 import type { AppSettings } from './types.js';
 
 const DEPRECATED_LOCAL_LLM_MODELS = new Set([
@@ -15,7 +16,7 @@ function getFastDictationSttModel(sourceLang: string | undefined): string {
 }
 
 function normalizeDictationSttModel(model: string | undefined, sourceLang: string | undefined): string {
-  const candidate = (model ?? '').trim();
+  const candidate = migrateRetiredSttModel((model ?? '').trim(), sourceLang ?? 'en');
   if (!candidate || candidate === 'whisper-mlx' || candidate === 'moonshine') {
     return sourceLang === 'auto' ? 'groq-whisper' : 'apple-stt';
   }
@@ -23,10 +24,7 @@ function normalizeDictationSttModel(model: string | undefined, sourceLang: strin
 }
 
 function normalizeSubtitleSttModel(model: string | undefined, sourceLang: string | undefined): string {
-  const candidate = (model ?? '').trim();
-  if (candidate === 'gemini-live') {
-    return candidate;
-  }
+  const candidate = migrateRetiredSttModel((model ?? '').trim(), sourceLang ?? 'en');
   if (sourceLang === 'auto' && candidate === 'apple-stt') {
     return 'sensevoice';
   }
@@ -37,10 +35,7 @@ function normalizeSubtitleSttModel(model: string | undefined, sourceLang: string
 }
 
 function normalizeMeetingSttModel(model: string | undefined, sourceLang: string | undefined): string {
-  const candidate = (model ?? '').trim();
-  if (candidate === 'gemini-live') {
-    return candidate;
-  }
+  const candidate = migrateRetiredSttModel((model ?? '').trim(), sourceLang ?? 'en');
   if (sourceLang === 'auto' && candidate === 'apple-stt') {
     return 'sensevoice';
   }
@@ -52,24 +47,18 @@ function normalizeMeetingSttModel(model: string | undefined, sourceLang: string 
 
 function normalizeSubtitleTranslateModel(sttModel: string, translateModel: string | undefined): string {
   const candidate = (translateModel ?? '').trim();
-  if (sttModel === 'gemini-live') {
-    return 'gemini-live';
-  }
   if (candidate === 'gemini-live') {
-    return 'google';
+    return 'apple-translation';
   }
-  return candidate || defaultSettings.translateModel;
+  return candidate === 'google' ? 'apple-translation' : candidate || defaultSettings.translateModel;
 }
 
 function normalizeMeetingTranslateModel(sttModel: string, translateModel: string | undefined): string {
   const candidate = (translateModel ?? '').trim();
-  if (sttModel === 'gemini-live') {
-    return candidate === 'disabled' ? 'disabled' : 'gemini-live';
-  }
   if (candidate === 'gemini-live') {
-    return 'google';
+    return 'apple-translation';
   }
-  return candidate || defaultSettings.meetingTranslateModel;
+  return candidate === 'google' ? 'apple-translation' : candidate || defaultSettings.meetingTranslateModel;
 }
 
 function normalizeDictationRewriteMode(mode: AppSettings['dictationRewriteMode'] | undefined): AppSettings['dictationRewriteMode'] {
@@ -146,7 +135,6 @@ export const defaultSettings: AppSettings = {
 Codex
 Gemini CLI`,
   dictationCloudApiKey: '',
-  geminiApiKey: process.env.GEMINI_API_KEY || '',
   dictationCloudModel: 'auto',
   dictationCloudLlmPrompt: `你是語音輸入的雲端文字整理器。
 請根據目前模式，先修正辨識錯字與專有名詞，再決定是否進一步整理語句。
@@ -204,7 +192,7 @@ Literal transcript:
   meetingSourceLang: 'zh-TW',
   meetingTargetLang: 'zh-TW',
   meetingSttModel: 'apple-stt',
-  meetingTranslateModel: 'google',
+  meetingTranslateModel: 'apple-translation',
   meetingSpeakerLabelsEnabled: true,
   meetingMicrophoneLabel: '我方',
   meetingSystemLabel: '遠端',
@@ -290,7 +278,6 @@ export function loadSettings(): AppSettings {
     dictationVocabularyContext: stored.dictationVocabularyContext ?? defaultSettings.dictationVocabularyContext,
     dictationProperNounCorrectionEnabled: stored.dictationProperNounCorrectionEnabled ?? defaultSettings.dictationProperNounCorrectionEnabled,
     dictationPersonalGlossary: stored.dictationPersonalGlossary ?? defaultSettings.dictationPersonalGlossary,
-    geminiApiKey: stored.geminiApiKey ?? defaultSettings.geminiApiKey,
     dictationLocalLlmModel: normalizeDictationLocalLlmModel(stored.dictationLocalLlmModel),
     dictationCloudEnhancementEnabled: false,
     meetingMicDeviceId: stored.meetingMicDeviceId ?? legacyDeviceId ?? '',

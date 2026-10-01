@@ -39,7 +39,6 @@ export interface CaptionConfig {
   dictationProperNounCorrectionEnabled?: boolean;
   dictationPersonalGlossary?: string;
   dictationCloudApiKey?: string;
-  geminiApiKey?: string;
   dictationCloudModel?: string;
   dictationCloudLlmPrompt?: string;
   dictationMaxRewriteExpansionRatio?: number;
@@ -302,7 +301,6 @@ export interface AppSettings {
   dictationProperNounCorrectionEnabled: boolean;
   dictationPersonalGlossary: string;
   dictationCloudApiKey: string;
-  geminiApiKey: string;
   dictationCloudModel: string;
   dictationCloudLlmPrompt: string;
   dictationLocalLlmModel: string;
@@ -361,4 +359,9 @@ export interface ModelDownloadProgress {
   percent: number;
   downloadedMB: number;
   totalMB: number;
+}
+
+export interface AppleTranslationStatus {
+  status: 'installed' | 'supported' | 'unsupported' | 'error';
+  message?: string;
 }

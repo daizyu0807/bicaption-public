@@ -199,6 +199,19 @@ for KEY in NSMicrophoneUsageDescription NSScreenCaptureUsageDescription; do
   fi
 done
 
+TRANSLATION_APP="$APP/Contents/Resources/AppleTranslationHelper.app"
+if [ -x "$TRANSLATION_APP/Contents/MacOS/apple-translation" ]; then
+  pass "Apple Translation helper packaged"
+else
+  fail "Apple Translation helper missing or not executable"
+fi
+TRANSLATION_ID=$(plutil -extract CFBundleIdentifier raw "$TRANSLATION_APP/Contents/Info.plist" 2>/dev/null || echo "")
+if [ "$TRANSLATION_ID" = "com.davedai.bicaption.apple-translation-helper" ]; then
+  pass "Apple Translation helper bundle identifier"
+else
+  fail "Apple Translation helper bundle identifier mismatch"
+fi
+
 # ── Summary ──
 echo ""
 if [ $ERRORS -eq 0 ]; then

@@ -21,7 +21,6 @@ modules = [
     "numpy",
     "sounddevice",
     "sherpa_onnx",
-    "deep_translator",
     "opencc",
 ]
 if sys.argv[1].lower() in {"1", "true", "yes", "on"}:

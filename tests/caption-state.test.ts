@@ -171,3 +171,24 @@ test('fully replayed final captions are ignored', () => {
   assert.equal(replay.captions.length, 1);
   assert.equal(replay.captions[0]?.segmentId, 'seg-1');
 });
+
+test('translation failure is visible independently of diagnostic errors and clears on recovery', () => {
+  const connected = reduceSidecarEvent(initialViewState, {
+    type: 'session_state', mode: 'subtitle', sessionId: 'session-1', state: 'connecting',
+  });
+  const failed = reduceSidecarEvent(connected, {
+    type: 'error', mode: 'subtitle', sessionId: 'session-1', code: 'translation_failed',
+    message: 'Google 翻譯請求受限', recoverable: true,
+  });
+  assert.equal(failed.translationError, 'Google 翻譯請求受限');
+  const diagnostic = reduceSidecarEvent(failed, {
+    type: 'error', mode: 'subtitle', sessionId: 'session-1', code: 'sidecar_stderr',
+    message: 'diagnostic', recoverable: true,
+  });
+  assert.equal(diagnostic.translationError, failed.translationError);
+  const recovered = reduceSidecarEvent(diagnostic, {
+    type: 'final_caption', mode: 'subtitle', sessionId: 'session-1', segmentId: 'seg-recovered',
+    sourceText: 'hello', translatedText: '你好', startedAtMs: 1, endedAtMs: 2, latencyMs: 1,
+  });
+  assert.equal(recovered.translationError, null);
+});

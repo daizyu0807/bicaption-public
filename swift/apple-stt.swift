@@ -483,6 +483,21 @@ let useAudioTap = CommandLine.arguments.contains("--audio-tap")
 let checkScreenCapture = CommandLine.arguments.contains("--check-screen-capture")
 let requestScreenCapture = CommandLine.arguments.contains("--request-screen-capture")
 
+// Setup-only actions: never start audio capture or the recognition pipeline.
+if CommandLine.arguments.contains("--check-speech-permission") {
+    emitJSON(["granted": SFSpeechRecognizer.authorizationStatus() == .authorized])
+    exit(0)
+}
+if CommandLine.arguments.contains("--request-speech-permission") {
+    let semaphore = DispatchSemaphore(value: 0)
+    SFSpeechRecognizer.requestAuthorization { status in
+        emitJSON(["granted": status == .authorized])
+        semaphore.signal()
+    }
+    semaphore.wait()
+    exit(0)
+}
+
 // Quick permission check: output JSON with granted status and exit.
 if checkScreenCapture {
     let bundle = Bundle.main

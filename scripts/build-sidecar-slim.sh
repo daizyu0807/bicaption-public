@@ -152,7 +152,6 @@ set +u
   --hidden-import sherpa_onnx \
   --hidden-import numpy \
   --hidden-import sounddevice \
-  --hidden-import deep_translator \
   --hidden-import opencc \
   --hidden-import _sounddevice_data \
   --collect-all sherpa_onnx \

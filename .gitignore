@@ -42,3 +42,14 @@ vendor/
 python/sidecar_fragment.py
 test_mlx_debug.py
 test_mlx_trace.py
+
+# Compiled experimental Apple helper
+
+AppleTranslationHelper.app/
+
+# Local validation and generated helpers
+acceptance/
+.cache/
+.debug/
+GlobalHotkeyHelper.app/
+python/global-hotkey
