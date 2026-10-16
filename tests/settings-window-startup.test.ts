@@ -31,7 +31,7 @@ function createHost() {
     isPackaged: true, isQuitting: false, trayAvailable: true, settingsWindow: null,
     app: { dock: { show() { dockVisible = true; }, hide() { dockVisible = false; } } },
     process: { platform: 'darwin', env: {} }, traceMain() {}, logEnvironmentReport() {},
-    createOverlayWindow() {}, createTray() { return true; },
+    createOverlayWindow() {}, createTray() { return true; }, scheduleStartupUpdateCheck() {},
     shouldHideDockForTray() { return true; }, shouldKeepDockVisibleWithoutTray() { return false; },
   });
   vm.runInContext(windowFunctions, context);

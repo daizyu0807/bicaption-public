@@ -1481,8 +1481,11 @@ class TranslationProviderTest(unittest.TestCase):
 
         sidecar_module.reset_breeze_gguf_model_cache()
         with tempfile.TemporaryDirectory() as directory, patch.object(sidecar_module, "MODEL_BASE_DIR", directory), \
+                patch.object(sidecar_module, "SENSEVOICE_MODEL_DIR", directory), \
                 patch.object(sidecar_module, "emit", side_effect=emitted.append), \
                 patch.object(sidecar_module, "SenseVoiceTranscriber", FakeTranscriber):
+            # SenseVoice counts as installed, whatever this machine has: without it the Apple speech fallback applies.
+            open(os.path.join(directory, "model.int8.onnx"), "w").close()
             os.environ.pop("BICAPTION_BREEZE_GGUF", None)
             transcriber = sidecar_module.get_streaming_transcriber(self._breeze_gguf_config(), announce=True)
         self.assertIsInstance(transcriber, FakeTranscriber)

@@ -14,7 +14,17 @@ const fs = require('fs');
 // An ad-hoc signature's default designated requirement is the exact cdhash, so every rebuild looked like a different
 // app to TCC and silently dropped the microphone / accessibility / screen-recording grants. Pin the requirement to the
 // bundle identifier instead; the grants then survive rebuilds of this locally signed app.
-const identifierRequirement = (identifier) => `--requirements '=designated => identifier "${identifier}"'`;
+//
+// With BICAPTION_SIGN_IDENTITY set to a certificate name (see scripts/make-signing-cert.sh) every build is signed by the
+// same certificate instead. codesign then writes `identifier ... and certificate leaf = H"..."` as the requirement on
+// its own, which also lets an update be checked against the app that is already installed. BICAPTION_SIGN_KEYCHAIN
+// points at the keychain holding that certificate. Without the variable nothing changes: ad-hoc signing as before.
+const SIGN_IDENTITY = (process.env.BICAPTION_SIGN_IDENTITY || '').trim() || '-';
+const SIGN_KEYCHAIN = (process.env.BICAPTION_SIGN_KEYCHAIN || '').trim();
+const signFlags = `--sign "${SIGN_IDENTITY}"${SIGN_KEYCHAIN ? ` --keychain "${SIGN_KEYCHAIN}"` : ''}`;
+const identifierRequirement = (identifier) => (
+  SIGN_IDENTITY === '-' ? `--requirements '=designated => identifier "${identifier}"'` : ''
+);
 
 module.exports = async function afterPack(context) {
   if (process.platform !== 'darwin') return;
@@ -34,7 +44,7 @@ module.exports = async function afterPack(context) {
 
   const bundleId = context.packager.appInfo.id; // com.davedai.bicaption
 
-  console.log(`[afterPack] Re-signing with identifier=${bundleId}`);
+  console.log(`[afterPack] Re-signing with identifier=${bundleId} identity=${SIGN_IDENTITY === '-' ? 'ad-hoc' : SIGN_IDENTITY}`);
 
   // Sign sidecar binary with audio-input entitlement (it uses sounddevice
   // to capture from microphone/AirPods — without this it silently fails).
@@ -48,7 +58,7 @@ module.exports = async function afterPack(context) {
   if (fs.existsSync(sidecarBinary)) {
     console.log(`[afterPack] Signing sidecar with audio-input entitlement`);
     execSync(
-      `codesign --force --sign - --identifier "${bundleId}.sidecar" ${identifierRequirement(`${bundleId}.sidecar`)} --entitlements "${entitlementsInherit}" "${sidecarBinary}"`,
+      `codesign --force ${signFlags} --identifier "${bundleId}.sidecar" ${identifierRequirement(`${bundleId}.sidecar`)} --entitlements "${entitlementsInherit}" "${sidecarBinary}"`,
       { stdio: 'inherit' },
     );
     // Also sign all .dylib and .so files in the sidecar directory
@@ -68,11 +78,11 @@ module.exports = async function afterPack(context) {
     }
     console.log(`[afterPack] Signing AppleSTTHelper with identifier=${helperBundleId}`);
     execSync(
-      `codesign --force --sign - --identifier "${helperBundleId}" ${identifierRequirement(helperBundleId)} "${appleSttHelperBinary}"`,
+      `codesign --force ${signFlags} --identifier "${helperBundleId}" ${identifierRequirement(helperBundleId)} "${appleSttHelperBinary}"`,
       { stdio: 'inherit' },
     );
     execSync(
-      `codesign --force --sign - --identifier "${helperBundleId}" ${identifierRequirement(helperBundleId)} "${appleSttHelperApp}"`,
+      `codesign --force ${signFlags} --identifier "${helperBundleId}" ${identifierRequirement(helperBundleId)} "${appleSttHelperApp}"`,
       { stdio: 'inherit' },
     );
   } else {
@@ -83,11 +93,11 @@ module.exports = async function afterPack(context) {
     const helperBundleId = `${bundleId}.global-hotkey-helper`;
     console.log(`[afterPack] Signing GlobalHotkeyHelper with identifier=${helperBundleId}`);
     execSync(
-      `codesign --force --sign - --identifier "${helperBundleId}" ${identifierRequirement(helperBundleId)} "${globalHotkeyHelperBinary}"`,
+      `codesign --force ${signFlags} --identifier "${helperBundleId}" ${identifierRequirement(helperBundleId)} "${globalHotkeyHelperBinary}"`,
       { stdio: 'inherit' },
     );
     execSync(
-      `codesign --force --sign - --identifier "${helperBundleId}" ${identifierRequirement(helperBundleId)} "${globalHotkeyHelperApp}"`,
+      `codesign --force ${signFlags} --identifier "${helperBundleId}" ${identifierRequirement(helperBundleId)} "${globalHotkeyHelperApp}"`,
       { stdio: 'inherit' },
     );
   } else {
@@ -102,7 +112,7 @@ module.exports = async function afterPack(context) {
       const itemPath = path.join(frameworksDir, item);
       try {
         execSync(
-          `codesign --force --deep --sign - --entitlements "${entitlementsInherit}" "${itemPath}"`,
+          `codesign --force --deep ${signFlags} --entitlements "${entitlementsInherit}" "${itemPath}"`,
           { stdio: 'pipe' },
         );
       } catch {
@@ -113,13 +123,13 @@ module.exports = async function afterPack(context) {
 
   // Sign the main binary with the correct identifier
   execSync(
-    `codesign --force --sign - --identifier "${bundleId}" ${identifierRequirement(bundleId)} --entitlements "${entitlements}" "${mainBinary}"`,
+    `codesign --force ${signFlags} --identifier "${bundleId}" ${identifierRequirement(bundleId)} --entitlements "${entitlements}" "${mainBinary}"`,
     { stdio: 'inherit' },
   );
 
   // Sign the app bundle
   execSync(
-    `codesign --force --sign - --identifier "${bundleId}" ${identifierRequirement(bundleId)} --entitlements "${entitlements}" "${appPath}"`,
+    `codesign --force ${signFlags} --identifier "${bundleId}" ${identifierRequirement(bundleId)} --entitlements "${entitlements}" "${appPath}"`,
     { stdio: 'inherit' },
   );
 
@@ -138,7 +148,7 @@ function signDylibsRecursive(dir, entitlements) {
       signDylibsRecursive(fullPath, entitlements);
     } else if (entry.name.endsWith('.dylib') || entry.name.endsWith('.so')) {
       try {
-        execSync(`codesign --force --sign - --entitlements "${entitlements}" "${fullPath}"`, { stdio: 'pipe' });
+        execSync(`codesign --force ${signFlags} --entitlements "${entitlements}" "${fullPath}"`, { stdio: 'pipe' });
       } catch {
         // ignore signing failures for individual libs
       }

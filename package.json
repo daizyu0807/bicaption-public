@@ -1,6 +1,6 @@
 {
   "name": "bicaption",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Realtime bilingual caption overlay for macOS — local STT with Apple on-device translation",
   "license": "MIT",
   "author": "davedai",

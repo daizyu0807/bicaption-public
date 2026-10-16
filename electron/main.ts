@@ -4,6 +4,8 @@ import { mergeCommaSeparatedTerms } from './dictation-terms.js';
 import { polishDictationText, prewarmAppleIntelligence, runAppleIntelligence } from './apple-intelligence.js';
 import { generateNativeMeetingInsights } from './meeting-insights.js';
 import { getAppleIntelligencePath } from './paths.js';
+import { compareVersions, decideInstall, normalizeVersion, pickUpdateAssets, resolveReleaseApiUrl, RELEASE_API_URL, type ReleaseAsset } from './update-core.js';
+import { appBundleFromExecPath, canWriteInstallDir, prepareUpdate, readLeafHash, startReplacement } from './updater.js';
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, Tray, nativeImage, screen, shell, systemPreferences } from 'electron';
 import type { MessageBoxOptions } from 'electron';
 import { execFile, execFileSync } from 'node:child_process';
@@ -70,7 +72,7 @@ let subtitleOverlayBoundsCache: OverlayBounds | null = null;
 let dictationOverlayBoundsCache: OverlayBounds | null = null;
 let tray: Tray | null = null;
 let trayAvailable = false;
-let updateStatus: 'idle' | 'checking' = 'idle';
+let updateStatus: 'idle' | 'checking' | 'updating' = 'idle';
 
 type FocusSnapshot = {
   inputBounds: OverlayBounds | null;
@@ -83,7 +85,6 @@ type FocusSnapshot = {
 };
 
 const GITHUB_RELEASES_URL = 'https://github.com/daizyu0807/bicaption-public/releases';
-const GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/daizyu0807/bicaption-public/releases/latest';
 
 const DEFAULT_SUBTITLE_OVERLAY_WIDTH = 900;
 const DEFAULT_SUBTITLE_OVERLAY_HEIGHT = 220;
@@ -1451,7 +1452,7 @@ function rebuildTrayMenu() {
     return;
   }
   const settings = loadSettings();
-  const updateMenuLabel = updateStatus === 'checking' ? '檢查更新中…' : '檢查更新';
+  const updateMenuLabel = updateStatus === 'updating' ? '更新中…' : updateStatus === 'checking' ? '檢查更新中…' : '檢查更新';
   const contextMenu = Menu.buildFromTemplate([
     {
       label: '打開設定',
@@ -1478,7 +1479,7 @@ function rebuildTrayMenu() {
     { type: 'separator' },
     {
       label: updateMenuLabel,
-      enabled: updateStatus !== 'checking',
+      enabled: updateStatus === 'idle',
       click: () => {
         void checkForAppUpdates(true);
       },
@@ -1676,27 +1677,6 @@ function shouldEnableAutoUpdater() {
   return isPackaged && !isDev;
 }
 
-function normalizeVersion(version: string) {
-  return version.trim().replace(/^v/i, '');
-}
-
-function compareVersions(left: string, right: string) {
-  const leftParts = normalizeVersion(left).split('.').map((part) => Number.parseInt(part, 10) || 0);
-  const rightParts = normalizeVersion(right).split('.').map((part) => Number.parseInt(part, 10) || 0);
-  const maxLength = Math.max(leftParts.length, rightParts.length);
-  for (let index = 0; index < maxLength; index += 1) {
-    const leftPart = leftParts[index] ?? 0;
-    const rightPart = rightParts[index] ?? 0;
-    if (leftPart > rightPart) {
-      return 1;
-    }
-    if (leftPart < rightPart) {
-      return -1;
-    }
-  }
-  return 0;
-}
-
 async function showUpdateInfo(message: string, detail?: string) {
   const options: MessageBoxOptions = {
     type: 'info',
@@ -1712,8 +1692,9 @@ async function showUpdateInfo(message: string, detail?: string) {
   await dialog.showMessageBox(options);
 }
 
-async function fetchLatestReleaseVersion() {
-  const response = await fetch(GITHUB_LATEST_RELEASE_API, {
+async function fetchLatestRelease() {
+  const apiUrl = resolveReleaseApiUrl(process.env.BICAPTION_UPDATE_API_URL);
+  const response = await fetch(apiUrl, {
     headers: {
       Accept: 'application/vnd.github+json',
       'User-Agent': 'BiCaption',
@@ -1722,14 +1703,69 @@ async function fetchLatestReleaseVersion() {
   if (!response.ok) {
     throw new Error(`GitHub release check failed (${response.status})`);
   }
-  const payload = await response.json() as { tag_name?: string; html_url?: string };
+  const payload = await response.json() as { tag_name?: string; html_url?: string; assets?: ReleaseAsset[] };
   if (!payload.tag_name) {
     throw new Error('GitHub release payload did not include tag_name');
   }
   return {
     version: normalizeVersion(payload.tag_name),
     url: payload.html_url || GITHUB_RELEASES_URL,
+    assets: payload.assets ?? [],
+    // A test server on this machine may serve the assets; the real release host is the only other accepted source.
+    allowLoopbackAssets: apiUrl !== RELEASE_API_URL,
   };
+}
+
+function showUpdateBox(options: MessageBoxOptions) {
+  return settingsWindow && !settingsWindow.isDestroyed()
+    ? dialog.showMessageBox(settingsWindow, options)
+    : dialog.showMessageBox(options);
+}
+
+async function installUpdateInApp(latest: Awaited<ReturnType<typeof fetchLatestRelease>>, currentApp: string, currentLeaf: string | null) {
+  const assets = pickUpdateAssets(latest.assets, latest.version, latest.allowLoopbackAssets);
+  if (!assets) throw new Error('這個 Release 沒有可驗證的安裝檔與校驗檔。');
+  updateStatus = 'updating';
+  rebuildTrayMenu();
+  let lastLogged = -1;
+  try {
+    const prepared = await prepareUpdate({
+      assets,
+      version: latest.version,
+      currentApp,
+      currentVersion: app.getVersion(),
+      currentLeaf,
+      workRoot: join(app.getPath('userData'), 'updates'),
+      onProgress: (fraction) => {
+        const step = Math.floor(fraction * 10);
+        if (step !== lastLogged) {
+          lastLogged = step;
+          traceMain(`update download ${step * 10}%`);
+        }
+      },
+    });
+    traceMain(`update verified version=${prepared.version}; handing over to the replacement script`);
+    startReplacement(prepared, currentApp, process.pid);
+    isQuitting = true;
+    app.quit();
+  } catch (error) {
+    updateStatus = 'idle';
+    rebuildTrayMenu();
+    throw error;
+  }
+}
+
+/** Looks for a newer release once a day, a little after start-up. It only speaks up when there is one. */
+function scheduleStartupUpdateCheck() {
+  if (!shouldEnableAutoUpdater()) return;
+  const stampPath = join(app.getPath('userData'), 'last-update-check');
+  let last = 0;
+  try { last = Number(readFileSync(stampPath, 'utf-8')) || 0; } catch { /* first run */ }
+  if (Date.now() - last < 24 * 60 * 60 * 1000) return;
+  setTimeout(() => {
+    try { writeFileSync(stampPath, String(Date.now())); } catch { /* the check still runs */ }
+    void checkForAppUpdates(false);
+  }, 20_000);
 }
 
 async function checkForAppUpdates(manual = false) {
@@ -1743,26 +1779,50 @@ async function checkForAppUpdates(manual = false) {
   updateStatus = 'checking';
   rebuildTrayMenu();
   try {
-    const latest = await fetchLatestReleaseVersion();
+    const latest = await fetchLatestRelease();
     const currentVersion = app.getVersion();
     const comparison = compareVersions(latest.version, currentVersion);
     updateStatus = 'idle';
     rebuildTrayMenu();
     traceMain(`releaseCheck current=${currentVersion} latest=${latest.version} comparison=${comparison}`);
     if (comparison > 0) {
-      const options: MessageBoxOptions = {
+      const currentApp = appBundleFromExecPath(process.execPath);
+      const currentLeaf = currentApp ? await readLeafHash(currentApp) : null;
+      const decision = decideInstall({
+        packaged: Boolean(currentApp),
+        currentLeaf,
+        assets: pickUpdateAssets(latest.assets, latest.version, latest.allowLoopbackAssets),
+        installDirWritable: currentApp ? canWriteInstallDir(currentApp) : false,
+        sessionActive: Boolean(activeSessionMode) || dictationFinalInProgress,
+      });
+      const canInstall = decision.mode === 'auto' && currentApp !== null;
+      const result = await showUpdateBox({
         type: 'info',
         message: `發現新版本 ${latest.version}`,
-        detail: '目前版本不支援 app 內自動更新，將前往 GitHub Releases 下載最新安裝包。',
-        buttons: ['稍後', '前往下載'],
-        defaultId: 1,
+        detail: canInstall
+          ? '可以直接在 app 內更新：會下載安裝檔、驗證 SHA-256 與簽章，通過後才安裝並自動重新啟動；若新版無法啟動，會自動還原目前的版本。'
+          : `將前往 GitHub Releases 下載最新安裝包。\n\n${decision.mode === 'manual' ? decision.reason : ''}`,
+        buttons: canInstall ? ['稍後', '前往下載', '立即更新'] : ['稍後', '前往下載'],
+        defaultId: canInstall ? 2 : 1,
         cancelId: 0,
-      };
-      const result = settingsWindow && !settingsWindow.isDestroyed()
-        ? await dialog.showMessageBox(settingsWindow, options)
-        : await dialog.showMessageBox(options);
+      });
       if (result.response === 1) {
         await shell.openExternal(latest.url);
+      } else if (result.response === 2 && canInstall && currentApp) {
+        try {
+          await installUpdateInApp(latest, currentApp, currentLeaf);
+        } catch (error) {
+          traceMain(`update install failed=${String(error)}`);
+          const failure = await showUpdateBox({
+            type: 'warning',
+            message: '更新失敗，已保留目前的版本',
+            detail: `${error instanceof Error ? error.message : String(error)}\n\n可以前往 GitHub Releases 手動下載。`,
+            buttons: ['知道了', '前往下載頁'],
+            defaultId: 1,
+            cancelId: 0,
+          });
+          if (failure.response === 1) await shell.openExternal(latest.url);
+        }
       }
       return;
     }
@@ -2119,6 +2179,7 @@ app.whenReady().then(() => {
   createSettingsWindow();
   createOverlayWindow();
   const trayCreated = createTray();
+  scheduleStartupUpdateCheck();
   if (shouldHideDockForTray({
     trayCreated,
     isPackaged,
