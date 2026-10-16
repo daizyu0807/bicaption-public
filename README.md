@@ -24,18 +24,24 @@ Live bilingual captions, meeting transcripts, and hold-to-talk dictation for mac
 
 - **雙語字幕**：擷取麥克風或系統音訊，在浮動視窗顯示原文與翻譯。「預覽字幕視窗」位於浮動視窗外觀設定。
 - **會議字幕**：保留原文與翻譯、區分音訊來源、複製或匯出逐字稿，並提供選用的會議筆記與報告功能。
-- **語音輸入**：按住快捷鍵說話，放開後辨識並複製或貼上文字；可選擇字典修正與潤稿。
+- **語音輸入**：按住快捷鍵說話，放開後辨識並複製或貼上文字；自動補標點與問號，可選擇個人詞庫與 Apple 智慧潤飾。貼上前會確認焦點與權限，選「貼到目前視窗」時貼完會還原原本的剪貼簿。
 - **Menubar 常駐**：關閉設定視窗後 App 會繼續執行。設定自動儲存；進行中的會議需以畫面上的套用操作更新設定。
 
 | 模型／功能 | 適用情境 | 準備方式 |
 | --- | --- | --- |
 | SFSpeechRecognizer | macOS 原生辨識、快速字幕與語音輸入 | 語音辨識權限 |
 | SenseVoice | 本地串流字幕與會議辨識 | App 內下載模型 |
-| Breeze ASR 25 | 台灣中文、中英混說的分段辨識 | App 內下載模型；本版包含執行元件 |
+| Breeze ASR 25 | 台灣中文、中英混說的分段辨識（會議與語音輸入） | App 內下載模型；本版包含執行元件 |
+| Breeze ASR 25 輕量版（GGUF） | 台灣中文語音輸入，新安裝的預設引擎；使用中約 1.4 GB 記憶體，閒置後釋放 | App 內下載模型（約 1 GB） |
+| Qwen3-ASR 0.6B（實驗） | 語音輸入，會使用個人詞庫 | App 內下載模型（約 0.6 GB） |
 | Groq Whisper | 選用線上辨識 | 使用者自行設定 API key 與網路 |
 | Apple 原生翻譯 | 雙語字幕與會議翻譯 | 下載語言包；不需要翻譯 API key |
 
 Apple 翻譯的 App 語言選項包含英文、繁體中文、日文與韓文。Breeze 的中英自動辨識會逐片段判斷來源語言；輸出速度受語句長度與硬體影響。原本的 Google 免費翻譯端點、實驗性 SpeechAnalyzer 與 Gemini Live 已移除。
+
+新安裝的預設值：語音輸入使用 Breeze 輕量版＋Apple 智慧潤飾，雙語字幕使用 SFSpeechRecognizer＋Apple 翻譯，會議字幕使用 SenseVoice。若 Breeze 與 SenseVoice 都尚未安裝，語音輸入會自動改用 SFSpeechRecognizer。已有的設定不會被改動。
+
+Apple 智慧潤飾需要支援 Apple 智慧功能的 macOS 26 以上環境，只負責補標點：「忠實修正」不改任何字，「潤飾整理」只刪除贅詞、重複與說錯後更正的部分；問號由規則補上，關閉潤飾時同樣適用。
 
 部分筆記／潤稿功能需另外設定選用模型或服務。本版不包含選用本地 LLM 潤稿 runtime。
 
@@ -74,10 +80,12 @@ The app is ad-hoc signed and not notarized. If macOS blocks the first launch, us
 
 - **Bilingual captions**: microphone or system audio, with source text and translation in a floating overlay. Preview is under floating-window appearance.
 - **Meeting captions**: bilingual transcripts, source labels, copy/export, and optional notes/report workflows.
-- **Dictation**: hold a hotkey to record, release to transcribe, then copy or paste. Optional dictionary correction and polishing are available.
+- **Dictation**: hold a hotkey to record, release to transcribe, then copy or paste. Punctuation and question marks are added automatically; a personal vocabulary and Apple Intelligence polish are optional. Auto-paste checks focus and permissions first and, in paste-only mode, restores your previous clipboard.
 - **Menu Bar mode**: closing settings keeps the app running in the menu bar. Settings save automatically.
-- **Recognition**: SFSpeechRecognizer, SenseVoice, Breeze ASR 25, and optional Groq Whisper. Local models require an in-app download; Groq requires your own API key.
+- **Recognition**: SFSpeechRecognizer, SenseVoice, Breeze ASR 25 (including the lightweight GGUF build, the default dictation engine for new installs), experimental Qwen3-ASR for dictation, and optional Groq Whisper. Local models require an in-app download; Groq requires your own API key.
 - **Translation**: Apple on-device translation, with English, Traditional Chinese, Japanese, and Korean app options. Download language packs first; no translation API key is needed.
+
+Defaults for new installs: dictation uses the Breeze lightweight engine with Apple polish, bilingual captions use SFSpeechRecognizer with Apple translation, and meeting captions use SenseVoice. If neither Breeze nor SenseVoice is installed, dictation falls back to SFSpeechRecognizer. Existing settings are left untouched. Apple polish needs macOS 26+ with Apple Intelligence available and only adds punctuation: faithful mode never changes a word, and polished mode only removes fillers, repeats and retracted self-corrections. Question marks are added by rule, with or without polish.
 
 Breeze supports Chinese/English code-switching through segmented recognition. Output timing depends on segment length and hardware. The free Google translation endpoint, experimental SpeechAnalyzer, and Gemini Live options have been removed. The default package does not include the optional local LLM polishing runtime.
 
