@@ -18,7 +18,15 @@ Live bilingual captions, meeting transcripts, and hold-to-talk dictation for mac
 4. 啟用雙語字幕前，在「使用準備」下載來源與目標語言的 Apple 翻譯語言包。
 5. 選用 SenseVoice、Breeze 等本地模型時，先在 App 內下載模型。
 
-目前採 ad-hoc 簽章，尚未經 Apple 公證。首次開啟若被 macOS 擋下，可在 Finder 右鍵選「打開」，或到「系統設定 → 隱私權與安全性」允許開啟。
+#### 第一次開啟被 macOS 擋下時
+
+BiCaption 目前沒有 Apple 開發者帳號，採自行簽章、未經 Apple 公證，所以 macOS 第一次會顯示「無法驗證」而不讓開啟。每台電腦只需放行一次：
+
+1. 先照常雙擊開啟一次 BiCaption，出現警告後按「完成」或「取消」。
+2. 打開「系統設定 → 隱私權與安全性」，往下捲到「安全性」，按 BiCaption 旁邊的 **「仍要打開」**，輸入登入密碼確認。
+3. 再開啟一次 BiCaption，選「打開」。
+
+macOS 14 以前也可以在 Finder 對 BiCaption 按右鍵選「打開」；macOS 15 起這個捷徑已被移除，請用上面的系統設定步驟。放行只影響 BiCaption 這個 App。
 
 ### 功能與模型
 
@@ -74,7 +82,15 @@ This release provides an **Apple Silicon (arm64)** build. Apple on-device transl
 4. Download Apple translation language packs before enabling bilingual captions.
 5. Download optional local recognition models from inside the app.
 
-The app is ad-hoc signed and not notarized. If macOS blocks the first launch, use Finder’s right-click **Open**, or allow it in **System Settings → Privacy & Security**.
+#### If macOS blocks the first launch
+
+BiCaption is self-signed and not notarized (there is no Apple Developer account behind it), so macOS shows a “cannot verify” warning the first time. You only need to allow it once per Mac:
+
+1. Open BiCaption once as usual and dismiss the warning.
+2. Go to **System Settings → Privacy & Security**, scroll to **Security**, and click **Open Anyway** next to BiCaption; confirm with your login password.
+3. Open BiCaption again and choose **Open**.
+
+On macOS 14 and earlier you can also right-click the app in Finder and choose **Open**; that shortcut was removed in macOS 15, so use the System Settings steps. Allowing it affects only BiCaption.
 
 ### Features
 
