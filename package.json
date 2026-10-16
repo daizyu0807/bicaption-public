@@ -1,6 +1,6 @@
 {
   "name": "bicaption",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "Realtime bilingual caption overlay for macOS — local STT with Apple on-device translation",
   "license": "MIT",
   "author": "davedai",
@@ -14,8 +14,9 @@
   },
   "main": "dist/electron/main.js",
   "scripts": {
-    "dev": "npm run build:apple-translation && node scripts/dev-electron.mjs",
-    "build": "npm run build:electron && npm run build:renderer",
+    "dev": "npm run build:apple-translation && npm run build:apple-intelligence && node scripts/dev-electron.mjs",
+    "build": "npm run build:apple-intelligence && npm run build:electron && npm run build:renderer",
+    "build:apple-intelligence": "bash scripts/build-apple-intelligence.sh",
     "build:electron": "tsc -p tsconfig.electron.json",
     "build:renderer": "node scripts/run-vite.mjs build",
     "build:global-hotkey": "bash scripts/build-global-hotkey.sh",
@@ -70,6 +71,10 @@
       "electron/preload.cjs"
     ],
     "extraResources": [
+      {
+        "from": "build/native/apple-intelligence",
+        "to": "apple-intelligence"
+      },
       {
         "from": "python/dist/bicaption-sidecar",
         "to": "sidecar"

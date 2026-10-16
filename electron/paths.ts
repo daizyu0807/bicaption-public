@@ -17,6 +17,12 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(__dirname, '../..');
 
+export function getAppleIntelligencePath(): string {
+  return isPackaged()
+    ? join(process.resourcesPath!, 'apple-intelligence')
+    : join(projectRoot, 'build', 'native', 'apple-intelligence');
+}
+
 export interface SidecarSpawnConfig {
   command: string;
   args: string[];

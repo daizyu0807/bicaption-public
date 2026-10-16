@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import type { AppleTranslationStatus } from '../electron/types.js';
 
 type PermissionKey = 'microphone' | 'speech' | 'screen' | 'accessibility' | 'input';
+const languageNames: Record<string, string> = {
+  auto: '自動偵測', en: '英文', 'zh-TW': '繁體中文', 'zh-CN': '簡體中文', ja: '日文', ko: '韓文',
+};
 
-export function SetupPanel({ source, target, translationEnabled, needsSpeech, sttModel = '', onPermissionsResolved, onClose }: {
-  source: string; target: string; translationEnabled: boolean; needsSpeech: boolean; sttModel?: string; onPermissionsResolved?: (ready: boolean) => void; onClose?: () => void;
+export function SetupPanel({ source, target, translationEnabled, needsSpeech, sttModel = '', onPermissionsResolved, onClose, actionTarget }: {
+  source: string; target: string; translationEnabled: boolean; needsSpeech: boolean; sttModel?: string; onPermissionsResolved?: (ready: boolean) => void; onClose?: () => void; actionTarget?: HTMLElement | null;
 }) {
   const [permissions, setPermissions] = useState<Partial<Record<PermissionKey, boolean>>>({});
   const [translation, setTranslation] = useState<AppleTranslationStatus | null>(null);
@@ -84,55 +88,41 @@ export function SetupPanel({ source, target, translationEnabled, needsSpeech, st
     finally { setBusy(false); }
   }
 
-  return <section className="setup-panel" id="usage-setup" aria-labelledby="setup-title">
-    <header className="setup-header">
-      <div className="setup-header-copy">
-        <h2 id="setup-title">使用準備</h2>
-        <p>準備收音與翻譯，聽寫功能可依需要再設定。</p>
+  const permissionNames: Record<PermissionKey, string> = {
+    microphone: '麥克風', screen: '系統音訊', speech: '語音辨識',
+    accessibility: '輔助使用', input: '輸入監控',
+  };
+  const keys: PermissionKey[] = ['microphone', 'screen', 'speech', 'accessibility', 'input'];
+  return <><section className="setup-panel va-card va-card-bodyless" id="usage-setup" aria-label="系統權限清單">
+    <div className="setup-body bc-card-body">
+      <div className="setup-checklist">
+        {keys.map(key => <div className="setup-row" key={key}>
+          <strong>{permissionNames[key]}</strong>
+          <div className="setup-permission-action">
+            {permissions[key] === undefined ? <span className="setup-permission-status">檢查中</span>
+              : permissions[key] ? <span className="setup-permission-status setup-ready"><span aria-hidden="true">✓</span>已允許</span>
+              : <button className="button-secondary" disabled={busy} title={`允許${permissionNames[key]}`} onClick={() => void request([key])}>允許</button>}
+          </div>
+        </div>)}
       </div>
-      {onClose && <button className="setup-dialog-close" type="button" aria-label="關閉使用準備" onClick={onClose}>×</button>}
-    </header>
-    <div className="setup-body">
-      <section className="setup-permissions" aria-labelledby="setup-permissions-title">
-        <h3 id="setup-permissions-title" className="sr-only">功能準備</h3>
-        <div className="setup-checklist">
-          <div className="setup-row">
-            <div><strong>字幕收音</strong><p>使用麥克風與系統音訊產生字幕。{needsSpeech ? ' Apple 辨識另需語音辨識授權。' : ''}</p></div>
-            {permissionsReady ? <span className="setup-ready"><span aria-hidden="true">✓</span> 已就緒</span> :
-              <button className="button-secondary" disabled={busy} onClick={() => void request(requiredPermissions)}>
-                {busy ? '設定中…' : '設定收音'}
-              </button>}
-          </div>
-          <div className="setup-row setup-optional-row">
-            <div><strong>聽寫輸入 <span className="setup-optional-label">選用</span></strong><p>使用快捷鍵或自動貼上時，才需要輸入監控與輔助使用。</p></div>
-            {dictationReady ? <span className="setup-ready"><span aria-hidden="true">✓</span> 已就緒</span> :
-              <button className="button-secondary" disabled={busy} onClick={() => void request(dictationPermissions)}>設定聽寫</button>}
-          </div>
-        </div>
-      </section>
-      {translationEnabled && <section className="setup-translation" aria-labelledby="setup-translation-title">
-        <div className="setup-section-heading"><h3 id="setup-translation-title">翻譯語言包</h3><span className="setup-local-label">Apple 本機翻譯</span></div>
-        <div className="setup-row">
-          <div><strong>{source === 'auto' || sttModel === 'breeze-asr-25' ? '自動辨識 → ' : `${({en:'英文', 'zh-TW':'繁體中文', ja:'日文', ko:'韓文'} as Record<string,string>)[source] ?? source} → `}{({en:'英文', 'zh-TW':'繁體中文', ja:'日文', ko:'韓文'} as Record<string,string>)[target] ?? target}</strong>
-            <p>{sttModel === 'breeze-asr-25' ? '準備中英文翻譯配對' : source === 'auto' ? '準備英文、繁中、日文與韓文的可用配對' : '下載一次，之後可離線翻譯'}</p></div>
-          {translation?.status === 'installed' ? <span className="setup-ready"><span aria-hidden="true">✓</span> 可離線使用</span> :
-            <button className="button-secondary" disabled={busy || translation?.status === 'unsupported'} onClick={() => void prepare()}>
-              {busy ? '準備中…' : '準備語言包'}
-            </button>}
-        </div>
-        {translation?.message && <p role="status" className="model-hint">{translation.message}</p>}
-      </section>}
-      {busy && <p role="status" className="model-hint">請完成系統提示；下載進度會顯示在 Apple 的視窗中。</p>}
+      {busy && <p role="status" className="model-hint">請完成系統授權提示。</p>}
       {error && <p role="alert" className="error-text">{error}</p>}
     </div>
-    <footer className="setup-footer">
-      <div className="setup-footer-copy"><strong>{restartNeeded ? '完成後，重新開啟一次' : ready ? '已完成準備' : '設定只需完成一次'}</strong>
-        <p>{restartNeeded ? '確認系統設定已勾選，再重新開啟 BiCaption。' : ready ? '可以關閉此視窗，回到字幕或語音輸入。' : '系統若詢問立即重開，可先選稍後，完成後再一起重開。'}</p>
-      </div>
-      <div className="setup-footer-actions">
+  </section>
+      {translationEnabled && <section className="setup-translation va-card va-card-bodyless" aria-labelledby="translation-pack-title">
+        <div className="bc-card-header"><h3 className="bc-card-title" id="translation-pack-title">翻譯語言包</h3></div>
+        <div className="bc-card-body">
+        <div className="setup-row">
+          <span>{languageNames[source] ?? source} → {languageNames[target] ?? target}</span>
+          {translation?.status === 'installed' ? <span className="setup-ready">已就緒</span> :
+            <button className="button-secondary" disabled={busy || translation?.status === 'unsupported'} onClick={() => void prepare()}>準備語言包</button>}
+        </div>
+        </div>
+      </section>}
+    {actionTarget && createPortal(<>
+        <button className="button-primary" disabled={busy || keys.every(key => permissions[key] === true) || keys.some(key => permissions[key] === undefined)} onClick={() => void request(keys)}>授予所有權限</button>
         <button className="button-secondary" disabled={busy} onClick={() => void refresh().catch(() => setError('無法檢查，請重試。'))}>重新檢查</button>
-        {restartNeeded && <button className="button-primary" disabled={busy} onClick={() => window.app.relaunchApp()}>完成設定並重新開啟一次</button>}
-      </div>
-    </footer>
-  </section>;
+        {restartNeeded && <button className="button-secondary" disabled={busy} onClick={() => window.app.relaunchApp()}>重新開啟</button>}
+    </>, actionTarget)}
+  </>;
 }

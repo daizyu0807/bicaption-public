@@ -33,6 +33,7 @@ release/
 python/dist/
 python/dist-slim/
 python/build/
+build/native/
 python/build-slim/
 python/build/*.spec
 .tmp-icon-out/
@@ -53,3 +54,15 @@ acceptance/
 .debug/
 GlobalHotkeyHelper.app/
 python/global-hotkey
+
+# Local Gemma model weights and runtime
+python/*.litertlm
+python/*.litertlm.verified.json
+python/gemma-runtime/
+
+# Pre-baseline local backups (contain withdrawn experiments)
+local-backups/
+python/apple-translation
+
+# model files fetched into the dev model directory
+python/*.gguf

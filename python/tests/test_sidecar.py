@@ -70,7 +70,6 @@ from sidecar import (
     normalize_groq_transcription_lang,
     is_groq_transcription_quota_error,
     normalize_text,
-    normalize_moonshine_lang,
     resolve_cloud_llm_model,
     parse_dictation_dictionary,
     parse_speaker_fingerprint,
@@ -469,15 +468,6 @@ class TranslationProviderTest(unittest.TestCase):
     def test_allows_normal_sentence(self) -> None:
         self.assertFalse(looks_like_garbage_text("People dream high in the quiet of the night"))
 
-    def test_normalize_moonshine_lang_maps_supported_languages(self) -> None:
-        self.assertEqual(normalize_moonshine_lang("en"), "en")
-        self.assertEqual(normalize_moonshine_lang("zh-TW"), "zh")
-        self.assertEqual(normalize_moonshine_lang("ja"), "ja")
-        self.assertEqual(normalize_moonshine_lang("ko"), "ko")
-
-    def test_normalize_moonshine_lang_rejects_auto(self) -> None:
-        self.assertIsNone(normalize_moonshine_lang("auto"))
-
     def test_normalize_mlx_whisper_lang_maps_traditional_chinese_and_auto(self) -> None:
         self.assertEqual(normalize_mlx_whisper_lang("zh-TW"), "zh")
         self.assertEqual(normalize_mlx_whisper_lang("en"), "en")
@@ -579,8 +569,58 @@ class TranslationProviderTest(unittest.TestCase):
         self.assertFalse(is_groq_transcription_quota_error(429, detail))
 
     def test_resolve_cloud_llm_model_defaults_auto_to_stable_model(self) -> None:
-        self.assertEqual(resolve_cloud_llm_model("auto", "zh-TW", "polished"), "llama-3.3-70b-versatile")
-        self.assertEqual(resolve_cloud_llm_model("", "en", "polished"), "llama-3.3-70b-versatile")
+        self.assertEqual(resolve_cloud_llm_model("auto", "zh-TW", "polished"), "openai/gpt-oss-120b")
+        self.assertEqual(resolve_cloud_llm_model("", "en", "polished"), "openai/gpt-oss-120b")
+
+    def test_gpt_oss_cloud_requests_keep_reasoning_short_and_leave_room_for_the_answer(self) -> None:
+        self.assertEqual(sidecar_module.cloud_llm_reasoning_options("openai/gpt-oss-120b", 80), {"reasoning_effort": "low", "max_tokens": 1104})
+        self.assertEqual(sidecar_module.cloud_llm_reasoning_options("qwen/qwen3.8-27b", 80), {"max_tokens": 80})
+
+    def test_cjk_spacing_never_puts_a_space_before_or_after_full_width_punctuation(self) -> None:
+        self.assertEqual(sidecar_module.apply_cjk_spacing("跑了refactor，然後把PR開到GitHub上面。"), "跑了 refactor，然後把 PR 開到 GitHub 上面。")
+        self.assertEqual(sidecar_module.apply_cjk_spacing("他說fail。CI掛了"), "他說 fail。CI 掛了")
+
+    def test_transcribe_probe_reports_a_missing_runtime_instead_of_raising(self) -> None:
+        with patch.dict(sys.modules, {"transcribe_cpp": None}):
+            result = sidecar_module.run_transcribe_probe()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["stage"], "import")
+
+    def test_transcribe_probe_loads_and_closes_a_model_and_returns_the_text(self) -> None:
+        import os
+        import tempfile
+        import wave
+
+        created: list = []
+        with tempfile.TemporaryDirectory() as directory:
+            wav = os.path.join(directory, "a.wav")
+            with wave.open(wav, "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(16000)
+                handle.writeframes(b"\x00\x00" * 1600)
+            with patch.dict(sys.modules, {"transcribe_cpp": self._closing_fake(created)}):
+                result = sidecar_module.run_transcribe_probe("/x/model.gguf", wav)
+        self.assertEqual((result["ok"], result["stage"], result["text"]), (True, "recognise", "x"))
+        self.assertTrue(created[0].closed)
+
+    def test_whisper_silence_hallucinations_are_dropped_but_real_sentences_are_kept(self) -> None:
+        for phrase in ("謝謝收看", "謝謝收看。", "感謝觀看本期節目", "請不吝點贊訂閱轉發", "字幕由 Amara.org 社群提供", "Thank you for watching.", "謝謝大家收看"):
+            self.assertTrue(sidecar_module.is_whisper_hallucination(phrase), phrase)
+        for phrase in ("謝謝你幫我看這個 bug", "我要訂閱這個方案，請幫我確認", "今天的字幕顯示有問題", "下午的 meeting 改到三點", ""):
+            self.assertFalse(sidecar_module.is_whisper_hallucination(phrase), phrase)
+
+    def test_breeze_gguf_session_returns_nothing_for_a_hallucinated_segment(self) -> None:
+        class FakeResult:
+            text = "謝謝收看"
+            language = "zh"
+
+        class FakeSession:
+            def run(self, pcm, **kwargs):
+                return FakeResult()
+
+        text, _language = sidecar_module.BreezeGgufSession(FakeSession()).recognize(__import__("numpy").zeros(1600, dtype="float32"))
+        self.assertEqual(text, "")
 
     def test_resolve_cloud_llm_model_preserves_manual_choice(self) -> None:
         self.assertEqual(resolve_cloud_llm_model("qwen/qwen3-32b", "zh-TW", "polished"), "qwen/qwen3-32b")
@@ -657,8 +697,8 @@ class TranslationProviderTest(unittest.TestCase):
         self.assertEqual(pending_system.size, 0)
 
     def test_dictation_batch_fallback_uses_buffer_length_for_mlx_whisper(self) -> None:
-        self.assertTrue(should_attempt_dictation_batch_fallback("whisper-mlx", [], 0.01, 16000))
-        self.assertFalse(should_attempt_dictation_batch_fallback("whisper-mlx", [], 0.5, 1000))
+        self.assertTrue(should_attempt_dictation_batch_fallback("groq-whisper", [], 0.01, 16000))
+        self.assertFalse(should_attempt_dictation_batch_fallback("groq-whisper", [], 0.5, 1000))
 
     def test_dictation_batch_fallback_uses_input_level_for_streaming_models(self) -> None:
         self.assertTrue(should_attempt_dictation_batch_fallback("sensevoice", [], 0.08, 1000))
@@ -874,6 +914,739 @@ class TranslationProviderTest(unittest.TestCase):
         self.assertIn("，但是", event["finalText"])
         self.assertFalse(event["finalText"].endswith("。"))
 
+    def test_sensevoice_recognizer_is_built_once_and_reused_across_sessions(self) -> None:
+        built = []
+
+        class FakeRecognizer:
+            pass
+
+        class FakeOfflineRecognizer:
+            @staticmethod
+            def from_sense_voice(**kwargs):
+                built.append(kwargs)
+                return FakeRecognizer()
+
+        class FakeSherpa:
+            OfflineRecognizer = FakeOfflineRecognizer
+
+        sidecar_module.reset_sensevoice_recognizer_cache()
+        with patch.object(sidecar_module, "sherpa_onnx", FakeSherpa):
+            first = sidecar_module.get_sensevoice_recognizer()
+            second = sidecar_module.get_sensevoice_recognizer()
+        sidecar_module.reset_sensevoice_recognizer_cache()
+        self.assertIs(first, second)
+        self.assertEqual(len(built), 1)
+
+    def test_idle_sensevoice_recognizer_is_released_but_a_recent_one_is_kept(self) -> None:
+        class FakeOfflineRecognizer:
+            @staticmethod
+            def from_sense_voice(**kwargs):
+                return object()
+
+        class FakeSherpa:
+            OfflineRecognizer = FakeOfflineRecognizer
+
+        sidecar_module.reset_sensevoice_recognizer_cache()
+        with patch.object(sidecar_module, "sherpa_onnx", FakeSherpa), patch.object(sidecar_module.time, "monotonic", return_value=1000.0):
+            first = sidecar_module.get_sensevoice_recognizer()
+        with patch.object(sidecar_module.time, "monotonic", return_value=1000.0 + 599):
+            self.assertFalse(sidecar_module.release_idle_sensevoice_recognizer(ttl_seconds=600))
+        with patch.object(sidecar_module.time, "monotonic", return_value=1000.0 + 601):
+            self.assertTrue(sidecar_module.release_idle_sensevoice_recognizer(ttl_seconds=600))
+            self.assertFalse(sidecar_module.release_idle_sensevoice_recognizer(ttl_seconds=600))
+        with patch.object(sidecar_module, "sherpa_onnx", FakeSherpa):
+            second = sidecar_module.get_sensevoice_recognizer()
+        sidecar_module.reset_sensevoice_recognizer_cache()
+        self.assertIsNot(first, second)
+
+    # ---- experimental GGUF SenseVoice backend (BICAPTION_SENSEVOICE_BACKEND=gguf) ----
+
+    @staticmethod
+    def _fake_sherpa(built: list):
+        class FakeOfflineRecognizer:
+            @staticmethod
+            def from_sense_voice(**kwargs):
+                built.append("sherpa")
+                return object()
+
+        class FakeSherpa:
+            OfflineRecognizer = FakeOfflineRecognizer
+
+        return FakeSherpa
+
+    @staticmethod
+    def _fake_transcribe_cpp(created: list):
+        class FakeResult:
+            def __init__(self, text, language):
+                self.text = text
+                self.language = language
+
+        class FakeSession:
+            def __init__(self):
+                self.seen = []
+
+            def run(self, pcm):
+                self.seen.append(pcm)
+                return FakeResult("你好 世界", "zh")
+
+        class FakeModel:
+            def __init__(self, path):
+                created.append(path)
+                self.closed = False
+
+            def session(self):
+                return FakeSession()
+
+            def close(self):
+                self.closed = True
+
+        class FakeModule:
+            Model = FakeModel
+            log_handlers: list = []
+
+            @staticmethod
+            def set_log_callback(handler):
+                FakeModule.log_handlers.append((len(created), handler))
+
+        return FakeModule
+
+    def _with_backend_env(self, **env):
+        import os
+        from unittest.mock import patch as _patch
+
+        sidecar_module.reset_sensevoice_recognizer_cache()
+        self.addCleanup(sidecar_module.reset_sensevoice_recognizer_cache)
+        keys = ("BICAPTION_SENSEVOICE_BACKEND", "BICAPTION_SENSEVOICE_GGUF")
+        patcher = _patch.dict(os.environ, {k: v for k, v in env.items()}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in keys:
+            if key not in env:
+                os.environ.pop(key, None)
+
+    def test_sensevoice_backend_defaults_to_sherpa_even_if_a_gguf_path_is_set(self) -> None:
+        built: list = []
+        self._with_backend_env(BICAPTION_SENSEVOICE_GGUF="/tmp/does-not-matter.gguf")
+        with patch.object(sidecar_module, "sherpa_onnx", self._fake_sherpa(built)):
+            backend = sidecar_module.get_sensevoice_recognizer()
+        self.assertNotIsInstance(backend, sidecar_module.GgufSenseVoiceModel)
+        self.assertEqual(built, ["sherpa"])
+
+    def test_gguf_backend_loads_the_model_once_and_hands_out_independent_sessions(self) -> None:
+        import tempfile
+        import numpy as np
+
+        created: list = []
+        with tempfile.NamedTemporaryFile(suffix=".gguf") as handle:
+            self._with_backend_env(BICAPTION_SENSEVOICE_BACKEND="gguf", BICAPTION_SENSEVOICE_GGUF=handle.name)
+            with patch.dict(sys.modules, {"transcribe_cpp": self._fake_transcribe_cpp(created)}):
+                first = sidecar_module.acquire_sensevoice_session()
+                second = sidecar_module.acquire_sensevoice_session()
+                text, lang = first.recognize(np.zeros(1600, dtype=np.float64))
+        self.assertEqual(created, [handle.name])
+        self.assertIsNot(first, second)
+        self.assertEqual((text, lang), ("你好 世界", "zh"))
+        self.assertEqual(first._session.seen[0].dtype, np.float32)
+
+    def test_gguf_backend_routes_native_logs_to_the_trace_file_and_never_to_stderr(self) -> None:
+        import io
+        import tempfile
+
+        created: list = []
+        traced: list = []
+        fake = self._fake_transcribe_cpp(created)
+        fake.log_handlers = []
+        stderr = io.StringIO()
+        with tempfile.NamedTemporaryFile(suffix=".gguf") as handle:
+            self._with_backend_env(BICAPTION_SENSEVOICE_BACKEND="gguf", BICAPTION_SENSEVOICE_GGUF=handle.name)
+            with patch.dict(sys.modules, {"transcribe_cpp": fake}), patch.object(sys, "stderr", stderr), \
+                    patch.object(sidecar_module, "trace_debug", side_effect=traced.append):
+                sidecar_module.get_sensevoice_recognizer()
+                (models_created_before_handler, handler), = fake.log_handlers
+                handler(1, "ggml_metal_library_init: using embedded metal library")
+                handler(4, "debug noise")
+                handler(2, "a warning")
+                handler(3, "a real error")
+        self.assertEqual(models_created_before_handler, 0, "the log handler must be installed before the model loads")
+        self.assertEqual(stderr.getvalue(), "")
+        joined = "\n".join(traced)
+        self.assertNotIn("ggml_metal_library_init", joined)
+        self.assertNotIn("debug noise", joined)
+        self.assertIn("a warning", joined)
+        self.assertIn("a real error", joined)
+        self.assertIn("SenseVoice backend: gguf", joined)
+
+    def test_gguf_backend_falls_back_to_sherpa_when_the_model_file_is_missing(self) -> None:
+        import io
+
+        built: list = []
+        self._with_backend_env(BICAPTION_SENSEVOICE_BACKEND="gguf", BICAPTION_SENSEVOICE_GGUF="/nonexistent/model.gguf")
+        stderr = io.StringIO()
+        traced: list = []
+        with patch.object(sidecar_module, "sherpa_onnx", self._fake_sherpa(built)), patch.object(sys, "stderr", stderr), \
+                patch.object(sidecar_module, "trace_debug", side_effect=traced.append):
+            backend = sidecar_module.get_sensevoice_recognizer()
+        self.assertNotIsInstance(backend, sidecar_module.GgufSenseVoiceModel)
+        self.assertEqual(built, ["sherpa"])
+        self.assertTrue(any("falling back to sherpa-onnx" in line for line in traced))
+        # Electron turns every stderr line into an error event, so this must stay quiet.
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_gguf_backend_falls_back_to_sherpa_when_the_binding_is_not_installed(self) -> None:
+        import tempfile
+
+        built: list = []
+        with tempfile.NamedTemporaryFile(suffix=".gguf") as handle:
+            self._with_backend_env(BICAPTION_SENSEVOICE_BACKEND="gguf", BICAPTION_SENSEVOICE_GGUF=handle.name)
+            with patch.object(sidecar_module, "sherpa_onnx", self._fake_sherpa(built)), patch.dict(sys.modules, {"transcribe_cpp": None}):
+                backend = sidecar_module.get_sensevoice_recognizer()
+        self.assertNotIsInstance(backend, sidecar_module.GgufSenseVoiceModel)
+        self.assertEqual(built, ["sherpa"])
+
+    def test_sensevoice_transcriber_recognize_normalises_text_and_language_for_both_backends(self) -> None:
+        class FakeSession:
+            def __init__(self, text, lang):
+                self._reply = (text, lang)
+
+            def recognize(self, audio):
+                return self._reply
+
+        transcriber = object.__new__(sidecar_module.SenseVoiceTranscriber)
+        transcriber.recognizer = FakeSession("你好  世界", "<|zh|>")
+        self.assertEqual(transcriber._recognize(None), ("你好 世界", "zh"))
+        transcriber.recognizer = FakeSession("hello", "en")
+        self.assertEqual(transcriber._recognize(None), ("hello", "en"))
+
+    def test_dictation_debug_audio_is_saved_only_when_the_env_dir_is_set(self) -> None:
+        import json as _json
+        import os
+        import tempfile
+        import wave as _wave
+
+        audio = np.linspace(-0.5, 0.5, sidecar_module.SAMPLE_RATE // 2, dtype=np.float32)
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("BICAPTION_SAVE_DICTATION_AUDIO_DIR", None)
+                self.assertIsNone(sidecar_module.maybe_save_dictation_debug_audio("abcdef123456", audio, "你好"))
+            with patch.dict(os.environ, {"BICAPTION_SAVE_DICTATION_AUDIO_DIR": directory}):
+                self.assertIsNone(sidecar_module.maybe_save_dictation_debug_audio("abcdef123456", np.zeros(0, dtype=np.float32), "x"))
+                path = sidecar_module.maybe_save_dictation_debug_audio("abcdef123456", audio, "你好")
+            self.assertTrue(path.endswith(".wav") and "abcdef12" in os.path.basename(path))
+            with _wave.open(path) as handle:
+                self.assertEqual((handle.getnchannels(), handle.getsampwidth(), handle.getframerate()), (1, 2, sidecar_module.SAMPLE_RATE))
+                self.assertEqual(handle.getnframes(), audio.size)
+            meta = _json.load(open(path[:-4] + ".json", encoding="utf-8"))
+            self.assertEqual(meta["literal"], "你好")
+            self.assertAlmostEqual(meta["seconds"], 0.5, places=2)
+
+    def test_system_default_device_id_follows_the_current_default_input(self) -> None:
+        calls: list = []
+
+        class FakeSd:
+            devices = [
+                {"name": "MacBook Pro的麥克風", "max_input_channels": 1, "max_output_channels": 0},
+                {"name": "AirPods", "max_input_channels": 1, "max_output_channels": 2},
+                {"name": "MacBook Pro的揚聲器", "max_input_channels": 0, "max_output_channels": 2},
+            ]
+            default_input = 0
+
+            @classmethod
+            def query_devices(cls):
+                calls.append("query")
+                return cls.devices
+
+            @classmethod
+            def query_hostapis(cls, index):
+                return {"default_input_device": cls.default_input, "default_output_device": 2}
+
+            @staticmethod
+            def _terminate():
+                calls.append("terminate")
+
+            @staticmethod
+            def _initialize():
+                calls.append("initialize")
+
+        with patch.object(sidecar_module, "sd", FakeSd):
+            self.assertEqual(sidecar_module.SYSTEM_DEFAULT_DEVICE_ID, "__system_default__")
+            first = sidecar_module.resolve_device(sidecar_module.SYSTEM_DEFAULT_DEVICE_ID, require_input=True)
+            FakeSd.default_input = 1  # the user connects AirPods and macOS switches the default input
+            second = sidecar_module.resolve_device(sidecar_module.SYSTEM_DEFAULT_DEVICE_ID, require_input=True)
+            output = sidecar_module.resolve_device(sidecar_module.SYSTEM_DEFAULT_DEVICE_ID, require_input=False)
+        self.assertEqual((first, second, output), (0, 1, 2))
+        # PortAudio caches its device list, so following the system means re-initialising it before each lookup.
+        self.assertEqual(calls.count("terminate"), 3)
+        self.assertEqual(calls.count("initialize"), 3)
+
+    def test_system_default_device_does_not_report_a_fallback_error_and_survives_a_failed_refresh(self) -> None:
+        emitted: list = []
+
+        class FakeSd:
+            @staticmethod
+            def query_devices():
+                return [{"name": "Mic", "max_input_channels": 1, "max_output_channels": 0}]
+
+            @staticmethod
+            def query_hostapis(index):
+                return {"default_input_device": 0, "default_output_device": -1}
+
+            @staticmethod
+            def _terminate():
+                raise RuntimeError("PortAudio busy")
+
+            @staticmethod
+            def _initialize():
+                raise RuntimeError("PortAudio busy")
+
+        with patch.object(sidecar_module, "sd", FakeSd), patch.object(sidecar_module, "emit", side_effect=emitted.append):
+            self.assertEqual(sidecar_module.resolve_device(sidecar_module.SYSTEM_DEFAULT_DEVICE_ID), 0)
+        self.assertEqual(emitted, [])
+
+    def test_dictation_reports_recording_only_after_the_microphone_is_actually_open(self) -> None:
+        order: list = []
+
+        class FakeCapture:
+            def __init__(self, *args, **kwargs):
+                order.append("capture created")
+
+            def start(self):
+                order.append("capture started")  # on AirPods this call alone can block for seconds
+
+            def stop(self):
+                pass
+
+        class FakeTranscriber:
+            def stop(self):
+                pass
+
+        def fake_emit(event):
+            if event.get("type") == "dictation_state":
+                order.append(f"event {event.get('state')}")
+
+        app = sidecar_module.SidecarApp()
+        with patch.object(sidecar_module, "AudioCapture", FakeCapture), \
+                patch.object(sidecar_module, "get_streaming_transcriber", return_value=FakeTranscriber()), \
+                patch.object(sidecar_module, "emit", side_effect=fake_emit), \
+                patch.object(sidecar_module.threading, "Thread"):
+            app.start_session({"mode": "dictation", "sessionId": "t1", "deviceId": "__system_default__",
+                               "translateModel": "disabled", "sttModel": "sensevoice"})
+        self.assertIn("event recording", order)
+        self.assertLess(order.index("capture started"), order.index("event recording"),
+                        "the UI must not say recording before the microphone is open")
+
+    # ---- experimental Qwen3-ASR backend (BICAPTION_SENSEVOICE_BACKEND=qwen3) ----
+
+    def test_qwen3_vocabulary_merges_prompt_terms_and_dictionary_targets_without_junk(self) -> None:
+        dictionary = "\n".join([
+            "# comment",
+            "Claude <= Cloud, Clod || AI, Anthropic",
+            "TypeScript <= type script",
+            "get hub => GitHub",
+            "claude <= cloud",
+            "bad line without arrows",
+        ])
+        terms = sidecar_module.build_qwen3_vocabulary("undefined, Claude, Codex, null,  , OpenAI", dictionary)
+        self.assertEqual(terms, ["Claude", "Codex", "OpenAI", "TypeScript", "GitHub"])
+        self.assertEqual(sidecar_module.build_qwen3_vocabulary("a, b, c, d", "", limit=2), ["a", "b"])
+        # the dedicated hot-word list has priority (Qwen3 weighs earlier terms more), then the prompt terms, then the dictionary
+        self.assertEqual(
+            sidecar_module.build_qwen3_vocabulary("Claude, Codex", "TypeScript <= type script", hotwords="NBA, PRD, claude"),
+            ["NBA", "PRD", "claude", "Codex", "TypeScript"],
+        )
+        self.assertEqual(sidecar_module.build_qwen3_vocabulary("", ""), [])
+
+    def _qwen3_fake(self, created: list, runs: list):
+        class FakeResult:
+            text = "你好 world"
+            language = "zh"
+
+        class FakeSession:
+            def run(self, pcm, **kwargs):
+                runs.append(kwargs)
+                return FakeResult()
+
+        class FakeModel:
+            def __init__(self, path):
+                created.append(path)
+
+            def session(self):
+                return FakeSession()
+
+            def close(self):
+                pass
+
+        class FakeModule:
+            Model = FakeModel
+
+            @staticmethod
+            def set_log_callback(handler):
+                pass
+
+        return FakeModule
+
+    def test_qwen3_backend_feeds_the_fixed_traditional_prompt_and_the_vocabulary(self) -> None:
+        import tempfile
+        import numpy as np
+
+        created: list = []
+        runs: list = []
+        with tempfile.NamedTemporaryFile(suffix=".gguf") as handle:
+            self._with_backend_env(BICAPTION_SENSEVOICE_BACKEND="qwen3", BICAPTION_QWEN3_GGUF=handle.name)
+            with patch.dict(sys.modules, {"transcribe_cpp": self._qwen3_fake(created, runs)}):
+                backend = sidecar_module.get_sensevoice_recognizer()
+                with_terms = sidecar_module.acquire_sensevoice_session(["Claude", "GitHub"])
+                without_terms = sidecar_module.acquire_sensevoice_session(None)
+                text, lang = with_terms.recognize(np.zeros(1600, dtype=np.float32))
+                without_terms.recognize(np.zeros(1600, dtype=np.float32))
+        self.assertIsInstance(backend, sidecar_module.Qwen3AsrModel)
+        self.assertEqual(created, [handle.name])
+        self.assertEqual((text, lang), ("你好 world", "zh"))
+        self.assertEqual(runs[0], {"prompt": sidecar_module.QWEN3_CONTEXT_PROMPT, "vocabulary": ["Claude", "GitHub"]})
+        self.assertEqual(runs[1], {"prompt": sidecar_module.QWEN3_CONTEXT_PROMPT})
+        self.assertIn("繁體中文", sidecar_module.QWEN3_CONTEXT_PROMPT)
+
+    def test_qwen3_backend_falls_back_to_sherpa_when_the_model_file_is_missing(self) -> None:
+        built: list = []
+        traced: list = []
+        self._with_backend_env(BICAPTION_SENSEVOICE_BACKEND="qwen3", BICAPTION_QWEN3_GGUF="/nonexistent/qwen3.gguf")
+        with patch.object(sidecar_module, "sherpa_onnx", self._fake_sherpa(built)), \
+                patch.object(sidecar_module, "trace_debug", side_effect=traced.append):
+            backend = sidecar_module.get_sensevoice_recognizer()
+        self.assertNotIsInstance(backend, sidecar_module.Qwen3AsrModel)
+        self.assertEqual(built, ["sherpa"])
+        self.assertTrue(any("falling back to sherpa-onnx" in line for line in traced))
+
+    def test_qwen3_model_is_released_after_three_idle_minutes_while_sensevoice_keeps_ten(self) -> None:
+        import tempfile
+
+        created: list = []
+        with tempfile.NamedTemporaryFile(suffix=".gguf") as handle:
+            self._with_backend_env(BICAPTION_SENSEVOICE_BACKEND="qwen3", BICAPTION_QWEN3_GGUF=handle.name)
+            with patch.dict(sys.modules, {"transcribe_cpp": self._qwen3_fake(created, [])}), \
+                    patch.object(sidecar_module.time, "monotonic", return_value=1000.0):
+                sidecar_module.get_sensevoice_recognizer()
+            self.assertEqual(sidecar_module.QWEN3_IDLE_TTL_SECONDS, 180.0)
+            with patch.object(sidecar_module.time, "monotonic", return_value=1000.0 + 179):
+                self.assertFalse(sidecar_module.release_idle_sensevoice_recognizer())
+            with patch.object(sidecar_module.time, "monotonic", return_value=1000.0 + 181):
+                self.assertTrue(sidecar_module.release_idle_sensevoice_recognizer())
+        self.assertEqual(sidecar_module.SENSEVOICE_IDLE_TTL_SECONDS, 600.0)
+
+    def test_dictation_passes_the_vocabulary_to_the_transcriber_only_for_dictation(self) -> None:
+        seen: list = []
+
+        class FakeTranscriber:
+            def __init__(self, min_silence_duration=0.3, vocabulary=None):
+                seen.append(vocabulary)
+
+        def config(mode):
+            return sidecar_module.SessionConfig(
+                mode=mode, session_id="s", device_id="d", output_device_id="", source_lang="zh-TW", target_lang="zh-TW",
+                stt_model="sensevoice", translate_model="disabled", chunk_ms=400, partial_stable_ms=500,
+                dictation_initial_prompt_text="Claude, GitHub", dictation_dictionary_text="TypeScript <= type script",
+                dictation_hotwords="NBA, PRD",
+            )
+
+        with patch.object(sidecar_module, "SenseVoiceTranscriber", FakeTranscriber):
+            sidecar_module.get_streaming_transcriber(config("dictation"), announce=False)
+            sidecar_module.get_streaming_transcriber(config("subtitle"), announce=False)
+        self.assertEqual(seen, [["NBA", "PRD", "Claude", "GitHub", "TypeScript"], None])
+
+    # ---- Qwen3-ASR as a regular dictation engine (stt_model "qwen3-asr") ----
+
+    def _qwen3_engine_config(self, **overrides):
+        values = dict(
+            mode="dictation", session_id="q3", device_id="d", output_device_id="", source_lang="zh-TW", target_lang="zh-TW",
+            stt_model="qwen3-asr", translate_model="disabled", chunk_ms=400, partial_stable_ms=500,
+            dictation_initial_prompt_text="Claude, GitHub", dictation_dictionary_text="TypeScript <= type script",
+            dictation_hotwords="NBA, PRD",
+        )
+        values.update(overrides)
+        return sidecar_module.SessionConfig(**values)
+
+    def test_the_qwen3_engine_loads_the_model_from_the_model_directory_and_feeds_it_the_vocabulary(self) -> None:
+        import os
+        import tempfile
+
+        created: list = []
+        runs: list = []
+        seen: list = []
+
+        class FakeTranscriber:
+            def __init__(self, min_silence_duration=0.3, vocabulary=None, session=None):
+                seen.append(session)
+
+        sidecar_module.reset_qwen3_model_cache()
+        self.addCleanup(sidecar_module.reset_qwen3_model_cache)
+        with tempfile.TemporaryDirectory() as directory:
+            open(os.path.join(directory, sidecar_module.QWEN3_MODEL_FILE), "wb").close()
+            with patch.object(sidecar_module, "MODEL_BASE_DIR", directory), \
+                    patch.dict(os.environ, {}, clear=False), \
+                    patch.dict(sys.modules, {"transcribe_cpp": self._qwen3_fake(created, runs)}), \
+                    patch.object(sidecar_module, "SenseVoiceTranscriber", FakeTranscriber):
+                os.environ.pop("BICAPTION_QWEN3_GGUF", None)
+                sidecar_module.get_streaming_transcriber(self._qwen3_engine_config(), announce=False)
+                sidecar_module.get_streaming_transcriber(self._qwen3_engine_config(), announce=False)
+                seen[0].recognize(__import__("numpy").zeros(1600, dtype="float32"))
+        self.assertEqual(created, [os.path.join(directory, sidecar_module.QWEN3_MODEL_FILE)], "the model is loaded once and shared")
+        self.assertIsNot(seen[0], seen[1], "each session gets its own Qwen3 session")
+        self.assertEqual(runs[0]["vocabulary"], ["NBA", "PRD", "Claude", "GitHub", "TypeScript"])
+        self.assertEqual(runs[0]["prompt"], sidecar_module.QWEN3_CONTEXT_PROMPT)
+
+    def test_a_missing_qwen3_model_is_reported_and_dictation_falls_back_to_sensevoice(self) -> None:
+        import os
+        import tempfile
+
+        emitted: list = []
+        built: list = []
+
+        class FakeTranscriber:
+            def __init__(self, min_silence_duration=0.3, vocabulary=None, session=None):
+                built.append(session)
+
+        sidecar_module.reset_qwen3_model_cache()
+        with tempfile.TemporaryDirectory() as directory, patch.object(sidecar_module, "MODEL_BASE_DIR", directory), \
+                patch.object(sidecar_module, "emit", side_effect=emitted.append), \
+                patch.object(sidecar_module, "SenseVoiceTranscriber", FakeTranscriber):
+            os.environ.pop("BICAPTION_QWEN3_GGUF", None)
+            transcriber = sidecar_module.get_streaming_transcriber(self._qwen3_engine_config(), announce=True)
+        self.assertIsInstance(transcriber, FakeTranscriber)
+        self.assertEqual(built, [None], "the fallback is the ordinary SenseVoice recogniser")
+        errors = [event for event in emitted if event.get("type") == "error"]
+        self.assertEqual(errors[0]["code"], "qwen3_asr_unavailable")
+        self.assertTrue(errors[0]["recoverable"])
+        self.assertIn("SenseVoice", errors[0]["message"])
+
+    def test_the_standalone_qwen3_model_is_released_after_three_idle_minutes(self) -> None:
+        import os
+        import tempfile
+
+        sidecar_module.reset_qwen3_model_cache()
+        self.addCleanup(sidecar_module.reset_qwen3_model_cache)
+        with tempfile.TemporaryDirectory() as directory:
+            open(os.path.join(directory, sidecar_module.QWEN3_MODEL_FILE), "wb").close()
+            with patch.object(sidecar_module, "MODEL_BASE_DIR", directory), \
+                    patch.dict(sys.modules, {"transcribe_cpp": self._qwen3_fake([], [])}), \
+                    patch.object(sidecar_module.time, "monotonic", return_value=500.0):
+                os.environ.pop("BICAPTION_QWEN3_GGUF", None)
+                sidecar_module.get_qwen3_model()
+            with patch.object(sidecar_module.time, "monotonic", return_value=500.0 + 179):
+                self.assertFalse(sidecar_module.release_idle_qwen3_model())
+            with patch.object(sidecar_module.time, "monotonic", return_value=500.0 + 181):
+                self.assertTrue(sidecar_module.release_idle_qwen3_model())
+                self.assertFalse(sidecar_module.release_idle_qwen3_model())
+
+    # ---- Breeze ASR 25 GGUF as a dictation engine (stt_model "breeze-gguf") ----
+
+    def _breeze_gguf_config(self):
+        return self._qwen3_engine_config(stt_model="breeze-gguf")
+
+    def test_the_breeze_gguf_engine_shares_one_model_and_forces_mandarin_without_prompt_or_hotwords(self) -> None:
+        import os
+        import tempfile
+
+        created: list = []
+        runs: list = []
+        seen: list = []
+
+        class FakeTranscriber:
+            def __init__(self, min_silence_duration=0.3, vocabulary=None, session=None):
+                seen.append(session)
+
+        sidecar_module.reset_breeze_gguf_model_cache()
+        self.addCleanup(sidecar_module.reset_breeze_gguf_model_cache)
+        with tempfile.TemporaryDirectory() as directory:
+            open(os.path.join(directory, sidecar_module.BREEZE_GGUF_MODEL_FILE), "wb").close()
+            with patch.object(sidecar_module, "MODEL_BASE_DIR", directory), \
+                    patch.dict(sys.modules, {"transcribe_cpp": self._qwen3_fake(created, runs)}), \
+                    patch.object(sidecar_module, "SenseVoiceTranscriber", FakeTranscriber):
+                os.environ.pop("BICAPTION_BREEZE_GGUF", None)
+                sidecar_module.get_streaming_transcriber(self._breeze_gguf_config(), announce=False)
+                sidecar_module.get_streaming_transcriber(self._breeze_gguf_config(), announce=False)
+                seen[0].recognize(__import__("numpy").zeros(1600, dtype="float32"))
+        self.assertEqual(created, [os.path.join(directory, sidecar_module.BREEZE_GGUF_MODEL_FILE)])
+        self.assertIsNot(seen[0], seen[1])
+        self.assertEqual(runs, [{"language": "zh"}], "Breeze got no prompt or vocabulary, only the language")
+
+    def test_a_missing_breeze_gguf_model_is_reported_and_dictation_falls_back_to_sensevoice(self) -> None:
+        import os
+        import tempfile
+
+        emitted: list = []
+        built: list = []
+
+        class FakeTranscriber:
+            def __init__(self, min_silence_duration=0.3, vocabulary=None, session=None):
+                built.append(session)
+
+        sidecar_module.reset_breeze_gguf_model_cache()
+        with tempfile.TemporaryDirectory() as directory, patch.object(sidecar_module, "MODEL_BASE_DIR", directory), \
+                patch.object(sidecar_module, "emit", side_effect=emitted.append), \
+                patch.object(sidecar_module, "SenseVoiceTranscriber", FakeTranscriber):
+            os.environ.pop("BICAPTION_BREEZE_GGUF", None)
+            transcriber = sidecar_module.get_streaming_transcriber(self._breeze_gguf_config(), announce=True)
+        self.assertIsInstance(transcriber, FakeTranscriber)
+        self.assertEqual(built[-1], None)
+        errors = [event for event in emitted if event.get("type") == "error"]
+        self.assertEqual(errors[0]["code"], "breeze_gguf_unavailable")
+        self.assertTrue(errors[0]["recoverable"])
+
+    def test_without_breeze_or_sensevoice_models_dictation_falls_back_to_apple_speech(self) -> None:
+        import tempfile
+
+        emitted: list = []
+        started: list = []
+
+        class FakeApple:
+            def __init__(self, source_lang="en", partial_stable_ms=600, contextual_strings=None):
+                self.source_lang = source_lang
+
+            def start(self):
+                started.append(self.source_lang)
+
+        sidecar_module.reset_breeze_gguf_model_cache()
+        with tempfile.TemporaryDirectory() as directory, patch.object(sidecar_module, "MODEL_BASE_DIR", directory), \
+                patch.object(sidecar_module, "SENSEVOICE_MODEL_DIR", directory), \
+                patch.object(sidecar_module.os.path, "isfile", side_effect=lambda path: str(path) == sidecar_module.APPLE_STT_BIN), \
+                patch.object(sidecar_module, "emit", side_effect=emitted.append), \
+                patch.object(sidecar_module, "AppleSttTranscriber", FakeApple):
+            transcriber = sidecar_module.get_streaming_transcriber(self._breeze_gguf_config(), announce=False)
+        self.assertIsInstance(transcriber, FakeApple)
+        self.assertEqual(len(started), 1)
+        self.assertEqual([e["code"] for e in emitted if e.get("type") == "error"], ["breeze_gguf_unavailable", "apple_stt_fallback"])
+
+    def test_the_breeze_gguf_model_is_really_closed_after_three_idle_minutes_and_not_under_a_live_session(self) -> None:
+        import gc
+        import os
+        import tempfile
+        import weakref
+
+        created: list = []
+        sidecar_module.reset_breeze_gguf_model_cache()
+        self.addCleanup(sidecar_module.reset_breeze_gguf_model_cache)
+        with tempfile.TemporaryDirectory() as directory:
+            open(os.path.join(directory, sidecar_module.BREEZE_GGUF_MODEL_FILE), "wb").close()
+            with patch.object(sidecar_module, "MODEL_BASE_DIR", directory), \
+                    patch.dict(sys.modules, {"transcribe_cpp": self._closing_fake(created)}), \
+                    patch.object(sidecar_module.time, "monotonic", return_value=100.0):
+                os.environ.pop("BICAPTION_BREEZE_GGUF", None)
+                model = sidecar_module.get_breeze_gguf_model()
+                session = model.new_session()
+            self.assertEqual(sidecar_module.BREEZE_GGUF_IDLE_TTL_SECONDS, 180.0)
+            with patch.object(sidecar_module.time, "monotonic", return_value=100.0 + 179):
+                self.assertFalse(sidecar_module.release_idle_breeze_gguf_model())
+            with patch.object(sidecar_module.time, "monotonic", return_value=100.0 + 181):
+                self.assertFalse(sidecar_module.release_idle_breeze_gguf_model(), "a live session keeps the model open")
+                del session
+                gc.collect()
+                reference = weakref.ref(model)
+                del model
+                self.assertTrue(sidecar_module.release_idle_breeze_gguf_model())
+            gc.collect()
+            self.assertTrue(created[0].closed)
+            self.assertIsNone(reference(), "nothing else keeps the model alive after the release")
+
+    def _closing_fake(self, created: list):
+        class FakeSession:
+            def run(self, pcm, **kwargs):
+                class R:
+                    text = "x"
+                    language = "zh"
+                return R()
+
+        class FakeModel:
+            def __init__(self, path):
+                self.closed = False
+                created.append(self)
+
+            def session(self):
+                return FakeSession()
+
+            def close(self):
+                self.closed = True
+
+        class FakeModule:
+            Model = FakeModel
+
+            @staticmethod
+            def set_log_callback(handler):
+                pass
+
+        return FakeModule
+
+    def test_idle_release_really_frees_the_qwen3_model_not_just_the_cache_entry(self) -> None:
+        import gc
+        import os
+        import tempfile
+        import weakref
+
+        created: list = []
+        sidecar_module.reset_qwen3_model_cache()
+        self.addCleanup(sidecar_module.reset_qwen3_model_cache)
+        with tempfile.TemporaryDirectory() as directory:
+            open(os.path.join(directory, sidecar_module.QWEN3_MODEL_FILE), "wb").close()
+            with patch.object(sidecar_module, "MODEL_BASE_DIR", directory), \
+                    patch.dict(sys.modules, {"transcribe_cpp": self._closing_fake(created)}), \
+                    patch.object(sidecar_module.time, "monotonic", return_value=100.0):
+                os.environ.pop("BICAPTION_QWEN3_GGUF", None)
+                model = sidecar_module.get_qwen3_model()
+        reference = weakref.ref(model)
+        del model
+        with patch.object(sidecar_module.time, "monotonic", return_value=100.0 + 181):
+            self.assertTrue(sidecar_module.release_idle_qwen3_model())
+        gc.collect()
+        self.assertTrue(created[0].closed, "the native model is closed when the cache lets go of it")
+        self.assertIsNone(reference(), "nothing (atexit included) may keep the model object alive after the release")
+
+    def test_idle_release_waits_while_a_session_is_still_in_use(self) -> None:
+        import gc
+        import os
+        import tempfile
+
+        created: list = []
+        sidecar_module.reset_qwen3_model_cache()
+        self.addCleanup(sidecar_module.reset_qwen3_model_cache)
+        with tempfile.TemporaryDirectory() as directory:
+            open(os.path.join(directory, sidecar_module.QWEN3_MODEL_FILE), "wb").close()
+            with patch.object(sidecar_module, "MODEL_BASE_DIR", directory), \
+                    patch.dict(sys.modules, {"transcribe_cpp": self._closing_fake(created)}), \
+                    patch.object(sidecar_module.time, "monotonic", return_value=100.0):
+                os.environ.pop("BICAPTION_QWEN3_GGUF", None)
+                session = sidecar_module.get_qwen3_model().new_session(None)
+        with patch.object(sidecar_module.time, "monotonic", return_value=100.0 + 900):
+            self.assertFalse(sidecar_module.release_idle_qwen3_model(), "a long dictation must not lose its model")
+            self.assertFalse(created[0].closed)
+            del session
+            gc.collect()
+            self.assertTrue(sidecar_module.release_idle_qwen3_model())
+        self.assertTrue(created[0].closed)
+
+    def test_idle_release_also_frees_the_sensevoice_gguf_model(self) -> None:
+        import gc
+        import tempfile
+        import weakref
+
+        created: list = []
+        with tempfile.NamedTemporaryFile(suffix=".gguf") as handle:
+            self._with_backend_env(BICAPTION_SENSEVOICE_BACKEND="gguf", BICAPTION_SENSEVOICE_GGUF=handle.name)
+            with patch.dict(sys.modules, {"transcribe_cpp": self._closing_fake(created)}), \
+                    patch.object(sidecar_module.time, "monotonic", return_value=100.0):
+                backend = sidecar_module.get_sensevoice_recognizer()
+            reference = weakref.ref(backend)
+            del backend
+            with patch.object(sidecar_module.time, "monotonic", return_value=100.0 + 601):
+                self.assertTrue(sidecar_module.release_idle_sensevoice_recognizer())
+            gc.collect()
+        self.assertTrue(created[0].closed)
+        self.assertIsNone(reference())
+
+    def test_apply_dictation_rules_rewrite_keeps_a_final_question_or_exclamation_mark(self) -> None:
+        self.assertEqual(apply_dictation_rules_rewrite("你覺得這樣可以嗎？"), "你覺得這樣可以嗎？")
+        self.assertEqual(apply_dictation_rules_rewrite("Is this fine?"), "Is this fine?")
+        self.assertEqual(apply_dictation_rules_rewrite("太好了！"), "太好了！")
+        # Sentence-final periods are still dropped on purpose (chat-style output).
+        self.assertEqual(apply_dictation_rules_rewrite("今天先到這裡。"), "今天先到這裡")
+
     def test_apply_dictation_rules_rewrite_adds_question_mark_before_turn_connector(self) -> None:
         rewritten = apply_dictation_rules_rewrite(
             "剛剛是這樣子嗎但是他沒有加上",
@@ -1004,6 +1777,25 @@ class TranslationProviderTest(unittest.TestCase):
         )
         self.assertTrue(accepted)
         self.assertIsNone(fallback_reason)
+
+    def test_should_accept_rewrite_rejects_prompt_fragments_and_collapsed_answers(self) -> None:
+        base = "好像判斷助音要出現在哪一個位置是足夠正確的但是使用哪一個標點符號還是會有問題"
+        for answer in ("enabled", "Disabled", "- None", "好像判斷"):
+            accepted, reason = should_accept_rewrite(base, answer, 1.3, [])
+            self.assertFalse(accepted, answer)
+            self.assertEqual(reason, "rewrite_too_short")
+        accepted, _ = should_accept_rewrite(base, "好像判斷標點要出現在哪一個位置是足夠正確的，但是使用哪一個標點符號還是會有問題", 1.3, [])
+        self.assertTrue(accepted)
+        accepted, _ = should_accept_rewrite("呃我想說那個我們明天開會", "我們明天開會", 1.3, [])
+        self.assertTrue(accepted, "removing fillers is still a valid rewrite")
+
+    def test_rules_punctuation_does_not_split_a_clause_at_le_or_haiyou(self) -> None:
+        self.assertEqual(apply_dictation_rules_rewrite("我昨天去了公司然後看到他", "zh-TW", "polished"), "我昨天去了公司，然後看到他")
+        self.assertEqual(apply_dictation_rules_rewrite("為什麼它還有切換的問題", "zh-TW", "polished"), "為什麼它還有切換的問題")
+        self.assertEqual(apply_dictation_rules_rewrite("這次你調整了什麼然後它的效果會更好", "zh-TW", "polished"), "這次你調整了什麼，然後它的效果會更好")
+
+    def test_rules_punctuation_does_not_end_with_a_period_after_le(self) -> None:
+        self.assertEqual(apply_dictation_rules_rewrite("已經做好了所以可以上線了", "zh-TW", "polished"), "已經做好了。所以可以上線了")
 
     def test_dictation_final_event_sets_fallback_reason_for_cloud_mode(self) -> None:
         event = build_dictation_final_event(

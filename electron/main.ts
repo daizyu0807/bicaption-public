@@ -1,4 +1,9 @@
+import { readNativeFocusWindow, resolveNativeFocusGeometry } from './dictation-native-window.js';
 import { prepareAppleTranslation } from './apple-translation.js';
+import { mergeCommaSeparatedTerms } from './dictation-terms.js';
+import { polishDictationText, prewarmAppleIntelligence, runAppleIntelligence } from './apple-intelligence.js';
+import { generateNativeMeetingInsights } from './meeting-insights.js';
+import { getAppleIntelligencePath } from './paths.js';
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, Tray, nativeImage, screen, shell, systemPreferences } from 'electron';
 import type { MessageBoxOptions } from 'electron';
 import { execFile, execFileSync } from 'node:child_process';
@@ -14,6 +19,9 @@ import { getActivateBehavior } from './activate-behavior.js';
 import { getTrayImagePreferenceOrder } from './tray-strategy.js';
 import { shouldHideDockForTray, shouldKeepDockVisibleWithoutTray } from './tray-startup.js';
 import { loadSettings, saveSettings } from './settings.js';
+import { buildDictationVocabularyFields } from './dictation-session-fields.js';
+import { applyQuestionMarks } from './dictation-punctuation.js';
+import { deliverDictationOutput, type PasteBlockReason } from './dictation-output.js';
 import { ModelDownloader } from './model-downloader.js';
 import { appendDictationLearningRecord, listDictationLearningRecords } from './dictation-learning.js';
 import { getAppleSttCommand, getAppleSttHelperAppPath, getDebugTracePath, getDictationLearningHistoryPath, getSidecarCommand, getGlobalHotkeyCommand, getManagedHuggingFaceHome, getModelDir, getSpawnCwd } from './paths.js';
@@ -40,10 +48,22 @@ let sessionTransitionPromise: Promise<void> | null = null;
 let hotkeyListenerMode: 'dictation' | 'test' | 'idle' = 'idle';
 let pendingDictationStop = false;
 let dictationHotkeyPressed = false;
+let dictationFinalInProgress = false;
+const deliveredDictationFinalSessions = new Set<string>();
+let dictationResultNeedsReading = false;
+// Sessions the user discarded with the on-screen X; late events from them must not bring the overlay back or paste.
+const cancelledDictationSessions = new Set<string>();
+let dictationOverlaySuppressed = false;
+let dictationStartToken = 0;
+let dictationSnapshotPending = false;
+const DICTATION_SNAPSHOT_OVERLAY_TIMEOUT_MS = 700;
+let dictationHotkeyDownAtMs: number | null = null;
+let dictationStartedByHotkeyAtMs: number | null = null;
 let dictationModifierOnlyStartTimeout: NodeJS.Timeout | null = null;
 let dictationStartedAtMs: number | null = null;
 let pendingDictationCancel = false;
 let pendingDictationPasteTarget: FocusSnapshot | null = null;
+let dictationOverlayTarget: FocusSnapshot | null = null;
 let dictationOverlayHideTimeout: NodeJS.Timeout | null = null;
 let overlayMode: 'hidden' | 'subtitle' | 'dictation' | 'preview' = 'hidden';
 let subtitleOverlayBoundsCache: OverlayBounds | null = null;
@@ -53,6 +73,7 @@ let trayAvailable = false;
 let updateStatus: 'idle' | 'checking' = 'idle';
 
 type FocusSnapshot = {
+  inputBounds: OverlayBounds | null;
   appName: string;
   windowTitle: string | null;
   windowX: number | null;
@@ -63,16 +84,17 @@ type FocusSnapshot = {
 
 const GITHUB_RELEASES_URL = 'https://github.com/daizyu0807/bicaption-public/releases';
 const GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/daizyu0807/bicaption-public/releases/latest';
-const GROQ_CHAT_COMPLETIONS_API = 'https://api.groq.com/openai/v1/chat/completions';
-const DEFAULT_GROQ_TEXT_MODEL = 'llama-3.3-70b-versatile';
-const MEETING_COPILOT_MAX_TRANSCRIPT_CHARS = 12000;
-const MEETING_COPILOT_TIMEOUT_MS = 15000;
 
 const DEFAULT_SUBTITLE_OVERLAY_WIDTH = 900;
 const DEFAULT_SUBTITLE_OVERLAY_HEIGHT = 220;
 const MIN_SUBTITLE_OVERLAY_WIDTH = 420;
 const MIN_SUBTITLE_OVERLAY_HEIGHT = 140;
 const DICTATION_OVERLAY_SIZE = 56;
+const DICTATION_OVERLAY_WIDTH = 288;
+const DICTATION_WARNING_VISIBLE_MS = 5000;
+// A modifier-only hotkey (Ctrl, Fn) waits this long to tell dictation apart from a shortcut such as Ctrl+C. Speech before
+// the microphone opens is lost, so keep it short; override for tuning with BICAPTION_DICTATION_MODIFIER_START_MS.
+const DICTATION_MODIFIER_ONLY_START_DELAY_MS = Math.max(0, Number(process.env.BICAPTION_DICTATION_MODIFIER_START_MS ?? 100) || 0);
 const TRAY_ICON_SIZE = 20;
 
 const bridge = new SidecarBridge();
@@ -351,134 +373,9 @@ function buildMeetingNotesPrompt(transcript: string, request: MeetingNotesReques
   ].join('\n');
 }
 
-function resolveGroqTextModel(model: string | undefined) {
-  const candidate = (model ?? '').trim();
-  if (candidate && candidate.toLowerCase() !== 'auto') {
-    return candidate;
-  }
-  return DEFAULT_GROQ_TEXT_MODEL;
-}
-
-function takeRecentMeetingTranscript(transcript: string) {
-  const normalized = transcript.trim();
-  if (normalized.length <= MEETING_COPILOT_MAX_TRANSCRIPT_CHARS) {
-    return normalized;
-  }
-  return normalized.slice(-MEETING_COPILOT_MAX_TRANSCRIPT_CHARS);
-}
-
-function resolveMeetingCopilotTargetLang(value: unknown) {
-  const candidate = typeof value === 'string' ? value.trim() : '';
-  if (candidate && candidate.length <= 20 && /^[a-z0-9-]+$/i.test(candidate)) {
-    return candidate;
-  }
-  return 'zh-TW';
-}
-
-function buildMeetingCopilotPrompt(transcript: string, request: MeetingCopilotInsightsRequest) {
-  const targetLang = resolveMeetingCopilotTargetLang(request?.targetLang);
-  return [
-    'You are a careful in-meeting copilot.',
-    `Target language: ${targetLang}.`,
-    'Return a minified JSON object with this exact shape:',
-    '{"summary":"string","topics":["string"],"reminders":["string"]}',
-    'Rules:',
-    '1. Base every factual claim strictly on the transcript excerpt.',
-    '2. Do not invent decisions, owners, dates, facts, or action items.',
-    '3. Keep summary short and useful for someone currently in the meeting.',
-    '4. Topics should name what is currently or recently being discussed.',
-    '5. Reminders should be lightweight unresolved points, questions, or follow-ups.',
-    '6. If there is not enough transcript yet, keep fields brief instead of guessing.',
-    '7. Return valid JSON only. Do not include markdown, code fences, or explanations.',
-    'Transcript excerpt:',
-    takeRecentMeetingTranscript(transcript),
-  ].join('\n');
-}
-
-function normalizeStringArray(value: unknown) {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value
-    .map((item) => String(item ?? '').trim())
-    .filter(Boolean)
-    .slice(0, 6);
-}
-
-function extractJsonObjectText(raw: string) {
-  const trimmed = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-  const start = trimmed.indexOf('{');
-  const end = trimmed.lastIndexOf('}');
-  if (start >= 0 && end > start) {
-    return trimmed.slice(start, end + 1);
-  }
-  return trimmed;
-}
-
 async function runMeetingCopilotInsights(request: MeetingCopilotInsightsRequest): Promise<MeetingCopilotInsightsResult> {
-  const transcript = (typeof request?.transcriptText === 'string' ? request.transcriptText : '').trim();
-  if (!transcript) {
-    throw new Error('No meeting transcript is available yet.');
-  }
-
-  const settings = loadSettings();
-  const apiKey = settings.dictationCloudApiKey.trim();
-  if (!apiKey) {
-    throw new Error('Groq API Key is required for meeting insights.');
-  }
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), MEETING_COPILOT_TIMEOUT_MS);
-  try {
-    const response = await fetch(GROQ_CHAT_COMPLETIONS_API, {
-      method: 'POST',
-      signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        'User-Agent': `BiCaption/${app.getVersion()}`,
-      },
-      body: JSON.stringify({
-        model: resolveGroqTextModel(settings.dictationCloudModel),
-        temperature: 0.2,
-        max_tokens: 700,
-        response_format: { type: 'json_object' },
-        messages: [
-          {
-            role: 'system',
-            content: 'You generate concise in-meeting insights. Return valid JSON only.',
-          },
-          {
-            role: 'user',
-            content: buildMeetingCopilotPrompt(transcript, request),
-          },
-        ],
-      }),
-    });
-    if (!response.ok) {
-      const detail = await response.text().catch(() => '');
-      throw new Error(`Groq meeting insights failed (${response.status})${detail ? `: ${detail.slice(0, 180)}` : ''}`);
-    }
-    const payload = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-    const content = payload.choices?.[0]?.message?.content?.trim() ?? '';
-    if (!content) {
-      throw new Error('Groq meeting insights returned an empty response.');
-    }
-    const parsed = JSON.parse(extractJsonObjectText(content)) as { summary?: unknown; topics?: unknown; reminders?: unknown };
-    return {
-      summary: String(parsed.summary ?? '').trim(),
-      topics: normalizeStringArray(parsed.topics),
-      reminders: normalizeStringArray(parsed.reminders),
-    };
-  } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error('Groq meeting insights timed out.');
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
+  return generateNativeMeetingInsights(request,
+    nativeRequest => runAppleIntelligence(getAppleIntelligencePath(), nativeRequest, 20_000));
 }
 
 function formatMeetingNotesMarkdown(result: MeetingNotesResult) {
@@ -685,6 +582,7 @@ function setOverlayMode(mode: 'hidden' | 'subtitle' | 'dictation' | 'preview') {
     return;
   }
   overlayMode = mode;
+  overlayWindow?.setFocusable(mode !== 'dictation');
   sendToWindows('overlay:mode', { mode });
 }
 
@@ -718,18 +616,20 @@ function getSubtitleOverlayBounds() {
 }
 
 function getDictationTargetDisplay() {
+  const target = dictationOverlayTarget ?? pendingDictationPasteTarget;
+  if (target?.inputBounds) return screen.getDisplayNearestPoint({ x: Math.round(target.inputBounds.x + target.inputBounds.width / 2), y: Math.round(target.inputBounds.y + target.inputBounds.height / 2) });
   if (
-    pendingDictationPasteTarget
-    && pendingDictationPasteTarget.windowX !== null
-    && pendingDictationPasteTarget.windowY !== null
-    && pendingDictationPasteTarget.windowWidth !== null
-    && pendingDictationPasteTarget.windowHeight !== null
+    target
+    && target.windowX !== null
+    && target.windowY !== null
+    && target.windowWidth !== null
+    && target.windowHeight !== null
   ) {
     return screen.getDisplayMatching({
-      x: pendingDictationPasteTarget.windowX,
-      y: pendingDictationPasteTarget.windowY,
-      width: Math.max(1, pendingDictationPasteTarget.windowWidth),
-      height: Math.max(1, pendingDictationPasteTarget.windowHeight),
+      x: target.windowX,
+      y: target.windowY,
+      width: Math.max(1, target.windowWidth),
+      height: Math.max(1, target.windowHeight),
     });
   }
   return screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
@@ -737,25 +637,18 @@ function getDictationTargetDisplay() {
 
 function getDefaultDictationOverlayBounds(targetDisplay = getDictationTargetDisplay()) {
   const workArea = targetDisplay.workArea;
-  const x = Math.round(workArea.x + (workArea.width - DICTATION_OVERLAY_SIZE) / 2);
+  const x = Math.round(workArea.x + (workArea.width - DICTATION_OVERLAY_WIDTH) / 2);
   const y = Math.round(workArea.y + workArea.height - DICTATION_OVERLAY_SIZE - 128);
   return {
     x,
     y,
-    width: DICTATION_OVERLAY_SIZE,
+    width: DICTATION_OVERLAY_WIDTH,
     height: DICTATION_OVERLAY_SIZE,
   } satisfies OverlayBounds;
 }
 
 function getDictationOverlayBounds() {
-  const targetDisplay = getDictationTargetDisplay();
-  if (dictationOverlayBoundsCache) {
-    const cachedDisplay = screen.getDisplayMatching(dictationOverlayBoundsCache);
-    if (cachedDisplay.id === targetDisplay.id) {
-      return dictationOverlayBoundsCache;
-    }
-  }
-  return getDefaultDictationOverlayBounds(targetDisplay);
+  return getDefaultDictationOverlayBounds(getDictationTargetDisplay());
 }
 
 function restoreSubtitleOverlayBounds() {
@@ -771,42 +664,86 @@ async function handleDictationFinal(event: SidecarEvent) {
   if (event.type !== 'dictation_final') {
     return;
   }
+  if (deliveredDictationFinalSessions.has(event.sessionId)) {
+    traceMain(`dictation final ignored because session=${event.sessionId} was already delivered`);
+    return;
+  }
+  deliveredDictationFinalSessions.add(event.sessionId);
+  if (deliveredDictationFinalSessions.size > 50) {
+    deliveredDictationFinalSessions.delete(deliveredDictationFinalSessions.values().next().value as string);
+  }
   traceMainVerbose(`dictation_final session=${event.sessionId} literal=${event.literalTranscript.length} final=${event.finalText.length}`);
   const settings = loadSettings();
+  const pasteTarget = pendingDictationPasteTarget;
+  const polishingStarted = Date.now();
+  if (settings.dictationAppleIntelligenceEnabled) {
+    sendToWindows('sidecar:event', {type: 'dictation_state', mode: 'dictation', sessionId: event.sessionId,
+      state: 'processing', detail: 'Apple 智慧潤飾中'} satisfies SidecarEvent);
+  }
+  const polished = settings.dictationAppleIntelligenceEnabled ? await polishDictationText(event.finalText || event.literalTranscript, {
+    enabled: settings.dictationAppleIntelligenceEnabled,
+    language: settings.dictationSourceLang,
+    style: settings.dictationOutputStyle,
+    glossary: settings.dictationProperNounCorrectionEnabled ? settings.dictationPersonalGlossary : '',
+    maxExpansionRatio: settings.dictationMaxRewriteExpansionRatio,
+  }, request => runAppleIntelligence(getAppleIntelligencePath(), request)) : {text: event.finalText || event.literalTranscript, applied: false, fallbackReason: undefined};
+  if (settings.dictationAppleIntelligenceEnabled) {
+    traceMain(`dictation apple_intelligence result=${polished.fallbackReason ?? 'ok'} latencyMs=${Date.now() - polishingStarted}`);
+    event = { ...event, finalText: polished.text,
+      rewriteBackend: polished.fallbackReason ? event.rewriteBackend : 'apple-intelligence',
+      rewriteApplied: event.rewriteApplied || polished.applied,
+      fallbackReason: polished.fallbackReason,
+      latencyMs: event.latencyMs + Date.now() - polishingStarted };
+  }
+  if (!settings.dictationAppleIntelligenceEnabled) {
+    // Without the Apple polish nothing else marks questions, and the sidecar rules cannot tell them from statements.
+    const marked = applyQuestionMarks(event.finalText || event.literalTranscript);
+    if (marked !== (event.finalText || event.literalTranscript)) event = { ...event, finalText: marked };
+  }
+  // The polish above can take a while; a newer session may have started meanwhile. Its paste target and hotkey
+  // state are not ours, so a result from an earlier session is only copied.
+  const sessionIsStale = Boolean(activeSessionId) && event.sessionId !== activeSessionId;
   appendDictationLearningRecord(
     getDictationLearningHistoryPath(),
     event as DictationFinalEvent,
     settings.dictationSourceLang,
   );
+  // Tell the overlay the text is ready now, not after the paste: from here until the output status arrives the user
+  // is waiting on the paste, which is the real 'outputting' stage.
+  sendToWindows('sidecar:event', event);
   const outputAction = settings.dictationOutputAction;
   const outputText = event.finalText || event.literalTranscript;
+  dictationResultNeedsReading = !outputText.trim();
   if (outputText.trim()) {
-    clipboard.writeText(outputText);
-    if (outputAction === 'copy') {
-      sendToWindows('dictation:output-status', {
-        type: 'dictation_output_status',
-        action: outputAction,
-        status: 'copied',
-      } satisfies DictationOutputStatusEvent);
-    } else {
-      const pasted = await tryPasteClipboard(outputAction, pendingDictationPasteTarget);
-      const fallbackDetail = pasted ? 'Pasted into foreground app.' : await getPasteFallbackDetail();
-      traceMain(
-        `dictation output action=${outputAction} status=${pasted ? 'pasted' : 'fallback'} detail=${fallbackDetail}`,
-      );
-      sendToWindows('dictation:output-status', {
-        type: 'dictation_output_status',
-        action: outputAction,
-        status: pasted ? 'pasted' : 'fallback',
-        detail: fallbackDetail,
-      } satisfies DictationOutputStatusEvent);
-    }
+    const result = await deliverDictationOutput({
+      clipboard,
+      checkPasteAllowed: () => checkPasteAllowed(pasteTarget),
+      sendPasteShortcut,
+      describeFallback: (reason) => reason === 'stale_session'
+        ? Promise.resolve('Late result from an earlier dictation, kept clipboard copy.')
+        : reason === 'accessibility_denied'
+          ? Promise.resolve('Accessibility permission missing, kept clipboard copy.')
+          : getPasteFallbackDetail(),
+      sleep,
+      trace: traceMain,
+    }, outputAction, outputText, { stale: sessionIsStale });
+    traceMain(`dictation output action=${outputAction} status=${result.status} detail=${result.detail ?? ''}`);
+    sendToWindows('dictation:output-status', {
+      type: 'dictation_output_status',
+      action: outputAction,
+      status: result.status,
+      detail: result.detail,
+    } satisfies DictationOutputStatusEvent);
+    dictationResultNeedsReading = result.status === 'fallback';
+  }
+  if (sessionIsStale) {
+    // A newer dictation owns the paste target, hotkey state and active session; leave them alone.
+    return;
   }
   pendingDictationPasteTarget = null;
   clearActiveSession(event.sessionId);
   dictationHotkeyPressed = false;
   pendingDictationStop = false;
-  sendToWindows('sidecar:event', event);
 }
 
 function runAppleScript(lines: string[]) {
@@ -826,6 +763,7 @@ function runAppleScript(lines: string[]) {
 }
 
 async function getFrontmostFocusSnapshot(): Promise<FocusSnapshot | null> {
+  const nativeWindowTask = readNativeFocusWindow();
   try {
     const output = (await runAppleScript([
       'tell application "System Events"',
@@ -836,19 +774,32 @@ async function getFrontmostFocusSnapshot(): Promise<FocusSnapshot | null> {
       'set windowY to ""',
       'set windowWidth to ""',
       'set windowHeight to ""',
+      'set inputX to ""', 'set inputY to ""', 'set inputWidth to ""', 'set inputHeight to ""',
+      'set focusWindow to front window of frontApp',
       'try',
-      'set windowTitle to name of front window of frontApp',
+      'set focusWindow to value of attribute "AXFocusedWindow" of frontApp',
       'end try',
       'try',
-      'set {windowX, windowY} to position of front window of frontApp',
+      'set windowTitle to name of focusWindow',
       'end try',
       'try',
-      'set {windowWidth, windowHeight} to size of front window of frontApp',
+      'set {windowX, windowY} to position of focusWindow',
       'end try',
-      'return appName & linefeed & windowTitle & linefeed & windowX & linefeed & windowY & linefeed & windowWidth & linefeed & windowHeight',
+      'try',
+      'set {windowWidth, windowHeight} to size of focusWindow',
+      'end try',
+      'try',
+      'set inputElement to value of attribute "AXFocusedUIElement" of frontApp',
+      'set inputRole to value of attribute "AXRole" of inputElement',
+      'if inputRole is in {"AXTextArea", "AXTextField", "AXComboBox"} then',
+      'set {inputX, inputY} to position of inputElement',
+      'set {inputWidth, inputHeight} to size of inputElement',
+      'end if',
+      'end try',
+      'return appName & linefeed & windowTitle & linefeed & windowX & linefeed & windowY & linefeed & windowWidth & linefeed & windowHeight & linefeed & inputX & linefeed & inputY & linefeed & inputWidth & linefeed & inputHeight & linefeed & unix id of frontApp',
       'end tell',
     ])).trimEnd();
-    const [appName, windowTitle, windowX, windowY, windowWidth, windowHeight] = output.split('\n');
+    const [appName, windowTitle, windowX, windowY, windowWidth, windowHeight, inputX, inputY, inputWidth, inputHeight, processId] = output.split('\n');
     if (!appName) {
       return null;
     }
@@ -859,13 +810,20 @@ async function getFrontmostFocusSnapshot(): Promise<FocusSnapshot | null> {
       const parsed = Number.parseInt(value, 10);
       return Number.isFinite(parsed) ? parsed : null;
     };
+    const inputCoordinates = [inputX, inputY, inputWidth, inputHeight].map(parseCoordinate);
+    let inputBounds = inputCoordinates.every(value => value !== null)
+      ? { x: inputCoordinates[0]!, y: inputCoordinates[1]!, width: inputCoordinates[2]!, height: inputCoordinates[3]! } : null;
+    const native = await nativeWindowTask;
+    if (native && native.pid !== Number(processId)) return null;
+    if (native) inputBounds = resolveNativeFocusGeometry(native.bounds, inputBounds).input;
     return {
+      inputBounds,
       appName,
       windowTitle: windowTitle || null,
-      windowX: parseCoordinate(windowX),
-      windowY: parseCoordinate(windowY),
-      windowWidth: parseCoordinate(windowWidth),
-      windowHeight: parseCoordinate(windowHeight),
+      windowX: native?.bounds.x ?? parseCoordinate(windowX),
+      windowY: native?.bounds.y ?? parseCoordinate(windowY),
+      windowWidth: native?.bounds.width ?? parseCoordinate(windowWidth),
+      windowHeight: native?.bounds.height ?? parseCoordinate(windowHeight),
     };
   } catch {
     return null;
@@ -907,7 +865,7 @@ function focusSnapshotsMatch(expected: FocusSnapshot, current: FocusSnapshot) {
   return true;
 }
 
-function sleep(ms: number) {
+function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -946,13 +904,10 @@ async function getPasteFallbackDetail() {
   return 'Paste unavailable, kept clipboard copy.';
 }
 
-async function tryPasteClipboard(action: DictationOutputAction, expectedTarget: FocusSnapshot | null) {
-  if (action === 'copy') {
-    return false;
-  }
+async function checkPasteAllowed(expectedTarget: FocusSnapshot | null): Promise<{ ok: true } | { ok: false; reason: PasteBlockReason }> {
   const accessibility = checkAccessibilityPermission();
   if (!accessibility.trusted) {
-    return false;
+    return { ok: false, reason: 'accessibility_denied' };
   }
   if (expectedTarget) {
     let currentFocus = await getFrontmostFocusSnapshotWithRetry();
@@ -961,15 +916,21 @@ async function tryPasteClipboard(action: DictationOutputAction, expectedTarget: 
       currentFocus = await getFrontmostFocusSnapshotWithRetry(2, 60);
     }
     if (!currentFocus || !focusSnapshotsMatch(expectedTarget, currentFocus)) {
-      return false;
+      return { ok: false, reason: currentFocus ? 'target_changed' : 'focus_unavailable' };
     }
   }
+  return { ok: true };
+}
+
+async function sendPasteShortcut() {
   try {
     await runAppleScript([
-      'tell application "System Events" to keystroke "v" using command down',
+      'tell application "System Events" to key code 9 using command down',
     ]);
     return true;
-  } catch {
+  } catch (error) {
+    const code = error instanceof Error ? error.message.match(/\((-?\d+)\)/)?.[1] ?? 'unknown' : 'unknown';
+    traceMain(`dictation paste_failed applescript_code=${code}`);
     return false;
   }
 }
@@ -999,9 +960,10 @@ function buildSessionConfig(settings: AppSettings, mode: SessionMode): CaptionCo
     bestOf: settings.bestOf,
     vadFilter: settings.vadFilter,
     conditionOnPrev: settings.conditionOnPrev,
-    dictationRewriteMode: isDictation ? settings.dictationRewriteMode : undefined,
+    dictationRewriteMode: isDictation ? (settings.dictationAppleIntelligenceEnabled ? 'rules' : settings.dictationRewriteMode) : undefined,
     dictationCloudEnhancementEnabled: isDictation ? settings.dictationCloudEnhancementEnabled : undefined,
     dictationOutputStyle: isDictation ? settings.dictationOutputStyle : undefined,
+    ...buildDictationVocabularyFields(settings, mode),
     dictationVocabularyContext: isDictation ? settings.dictationVocabularyContext : undefined,
     dictationProperNounCorrectionEnabled: isDictation ? settings.dictationProperNounCorrectionEnabled : undefined,
     dictationPersonalGlossary: isDictation ? settings.dictationPersonalGlossary : undefined,
@@ -1173,13 +1135,41 @@ function runSessionTransition(task: () => Promise<void>) {
 }
 
 async function startDictationFromHotkey() {
+  dictationOverlaySuppressed = false;
+  // Speaking takes seconds; use that time to load the on-device polish model so releasing the key does not wait for it.
+  if (loadSettings().dictationAppleIntelligenceEnabled) {
+    void prewarmAppleIntelligence(getAppleIntelligencePath()).then(ok => traceMainVerbose(`dictation apple_intelligence prewarm=${ok}`));
+  }
+  // Clear the previous result in the renderer before the overlay can be shown with it.
+  sendToWindows('dictation:starting', {});
   traceMainVerbose(`startDictationFromHotkey enter pressed=${String(dictationHotkeyPressed)} activeMode=${activeSessionMode ?? 'none'} pendingStop=${String(pendingDictationStop)} transition=${String(Boolean(sessionTransitionPromise))}`);
-  pendingDictationPasteTarget = await getFrontmostFocusSnapshotWithRetry();
-  traceMainVerbose(
-    `startDictationFromHotkey captured paste target app=${pendingDictationPasteTarget?.appName ?? 'none'} `
-    + `window=${pendingDictationPasteTarget?.windowTitle ?? 'none'}`,
-  );
-  showDictationOverlay();
+  // The focus snapshot (AppleScript, ~0.3s and occasionally seconds) used to be awaited here, which delayed the
+  // microphone and swallowed the first word. It now runs alongside the session start. The overlay is still only
+  // shown once the paste target is recorded (or after a short timeout), because showing it first could change focus.
+  const startToken = ++dictationStartToken;
+  dictationStartedByHotkeyAtMs = dictationHotkeyDownAtMs ?? Date.now();
+  pendingDictationPasteTarget = null;
+  dictationOverlayTarget = null;
+  dictationOverlayBoundsCache = null;
+  dictationSnapshotPending = true;
+  const revealOverlay = () => {
+    if (startToken !== dictationStartToken || !dictationSnapshotPending) return;
+    dictationSnapshotPending = false;
+    if (!dictationOverlaySuppressed) showDictationOverlay();
+  };
+  setTimeout(revealOverlay, DICTATION_SNAPSHOT_OVERLAY_TIMEOUT_MS);
+  void getFrontmostFocusSnapshotWithRetry().then((snapshot) => {
+    if (startToken !== dictationStartToken) return; // a newer press (or a cancel) owns the target now
+    pendingDictationPasteTarget = snapshot;
+    dictationOverlayTarget = snapshot;
+    traceMain(`dictation focus_snapshot ms=${Date.now() - dictationStartedByHotkeyAtMs!} window=${JSON.stringify(snapshot ? [snapshot.windowX, snapshot.windowY, snapshot.windowWidth, snapshot.windowHeight] : null)} input=${JSON.stringify(snapshot?.inputBounds ?? null)}`);
+    traceMainVerbose(`startDictationFromHotkey captured paste target app=${snapshot?.appName ?? 'none'} window=${snapshot?.windowTitle ?? 'none'}`);
+    if (dictationSnapshotPending) {
+      revealOverlay();
+    } else if (!dictationOverlaySuppressed && overlayMode === 'dictation' && overlayWindow && !overlayWindow.isDestroyed()) {
+      overlayWindow.setBounds(getDictationOverlayBounds()); // the timeout already showed it; re-anchor on the real target
+    }
+  });
   await runSessionTransition(async () => {
     if (activeSessionMode) {
       traceMainVerbose(`startDictationFromHotkey stopping active session=${activeSessionId ?? 'none'}`);
@@ -1336,22 +1326,30 @@ function showDictationOverlay() {
     if (isSubtitleSizedBounds(currentBounds)) {
       subtitleOverlayBoundsCache = currentBounds;
     }
-    overlayWindow.setBounds(getDictationOverlayBounds());
+    const bounds = getDictationOverlayBounds();
+    traceMain(`dictation overlay_bounds=${JSON.stringify(bounds)} display=${getDictationTargetDisplay().id}`);
+    overlayWindow.setBounds(bounds);
   }
   overlayWindow?.showInactive();
+}
+
+function hideDictationOverlayNow() {
+  clearDictationOverlayHideTimeout();
+  dictationOverlayTarget = null;
+  if (activeSessionMode === 'subtitle') {
+    restoreSubtitleOverlayBounds();
+    setOverlayMode('subtitle');
+    return;
+  }
+  setOverlayMode('hidden');
+  overlayWindow?.hide();
 }
 
 function hideDictationOverlaySoon(delayMs = 1800) {
   clearDictationOverlayHideTimeout();
   dictationOverlayHideTimeout = setTimeout(() => {
     dictationOverlayHideTimeout = null;
-    if (activeSessionMode === 'subtitle') {
-      restoreSubtitleOverlayBounds();
-      setOverlayMode('subtitle');
-      return;
-    }
-    setOverlayMode('hidden');
-    overlayWindow?.hide();
+    hideDictationOverlayNow();
   }, delayMs);
 }
 
@@ -1600,12 +1598,20 @@ function bindBridge() {
     if (event.type === 'session_state' && event.state === 'error') {
       clearActiveSession(event.sessionId);
     }
+    if (event.type === 'session_state' && event.mode === 'dictation' && event.state === 'streaming' && dictationHotkeyDownAtMs !== null) {
+      // Everything the user says before this point is lost, so it is the number to watch.
+      traceMain(`dictation hotkey_to_streaming_ms=${Date.now() - dictationHotkeyDownAtMs}`);
+      dictationHotkeyDownAtMs = null;
+    }
     rebuildTrayMenu();
     sendToWindows('sidecar:event', event);
   });
   bridge.on('dictation_state', (event: SidecarEvent) => {
+    if (event.type === 'dictation_state' && (dictationOverlaySuppressed || cancelledDictationSessions.has(event.sessionId))) {
+      return;
+    }
     if (event.type === 'dictation_state') {
-      showDictationOverlay();
+      if (!dictationSnapshotPending) showDictationOverlay();
       if (event.state === 'stopped' || event.state === 'error') {
         dictationHotkeyPressed = false;
       }
@@ -1613,8 +1619,20 @@ function bindBridge() {
     forwardEvent(event);
   });
   bridge.on('dictation_final', (event: SidecarEvent) => {
-    void handleDictationFinal(event);
-    hideDictationOverlaySoon();
+    if (event.type === 'dictation_final' && cancelledDictationSessions.delete(event.sessionId)) {
+      traceMain(`dictation final dropped because the user cancelled session=${event.sessionId}`);
+      return;
+    }
+    dictationFinalInProgress = true;
+    void handleDictationFinal(event).catch(() => {
+      traceMain('dictation final output failed');
+    }).finally(() => {
+      dictationFinalInProgress = false;
+      // A blocked paste or an empty result carries a message the user has to be able to read.
+      // A newer session that is still active owns the overlay; only hide it when nothing else is running.
+      if (!activeSessionId) hideDictationOverlaySoon(dictationResultNeedsReading ? DICTATION_WARNING_VISIBLE_MS : 1800);
+      dictationResultNeedsReading = false;
+    });
   });
   bridge.on('session_stopped_ack', (event: SidecarEvent) => {
     if (event.type === 'session_stopped_ack') {
@@ -1652,18 +1670,6 @@ function bindBridge() {
 
 function forwardEvent(event: SidecarEvent) {
   sendToWindows('sidecar:event', event);
-}
-
-function mergeCommaSeparatedTerms(current: string, incoming: string) {
-  const merged = new Map<string, string>();
-  for (const term of `${current},${incoming}`.split(',')) {
-    const normalized = term.trim();
-    if (!normalized) {
-      continue;
-    }
-    merged.set(normalized.toLowerCase(), normalized);
-  }
-  return Array.from(merged.values()).join(', ');
 }
 
 function shouldEnableAutoUpdater() {
@@ -1790,6 +1796,7 @@ async function checkForAppUpdates(manual = false) {
 function forwardHotkeyEvent(event: DictationHotkeyEvent) {
   traceMainVerbose(`hotkey event=${event.type} keyCode=${String(event.keyCode)} pressed=${String(dictationHotkeyPressed)} mode=${hotkeyListenerMode}`);
   sendToWindows('dictation:hotkey-event', event);
+  if (dictationFinalInProgress) return;
   if (hotkeyListenerMode !== 'dictation') {
     return;
   }
@@ -1798,6 +1805,7 @@ function forwardHotkeyEvent(event: DictationHotkeyEvent) {
       return;
     }
     dictationHotkeyPressed = true;
+    dictationHotkeyDownAtMs = Date.now();
     if (isModifierOnlyBindingActive()) {
       clearDictationModifierOnlyStartTimeout();
       dictationModifierOnlyStartTimeout = setTimeout(() => {
@@ -1806,7 +1814,7 @@ function forwardHotkeyEvent(event: DictationHotkeyEvent) {
           return;
         }
         void startDictationFromHotkey();
-      }, 160);
+      }, DICTATION_MODIFIER_ONLY_START_DELAY_MS);
       return;
     }
     void startDictationFromHotkey();
@@ -2105,6 +2113,7 @@ function logEnvironmentReport() {
 
 app.whenReady().then(() => {
   traceMain('app.whenReady entered');
+  traceMain('dictation focus_revision=4');
   logEnvironmentReport();
 
   createSettingsWindow();
@@ -2189,6 +2198,34 @@ app.whenReady().then(() => {
   ipcMain.handle('dictation:test-hotkey', (_event, binding: DictationHotkeyBinding) => {
     hotkeyListenerMode = 'test';
     nativeHotkeyBridge.startListening(binding);
+    return { ok: true };
+  });
+  // The on-screen check ends the recording at once (same as releasing the hotkey); the X throws the take away and
+  // closes the whole overlay immediately, whatever stage the session is in.
+  ipcMain.handle('dictation:confirm', async () => {
+    if (activeSessionMode !== 'dictation' && !sessionTransitionPromise) return { ok: false };
+    emitLocalDictationProcessingState();
+    dictationHotkeyPressed = false;
+    await stopDictationFromHotkey();
+    return { ok: true };
+  });
+  ipcMain.handle('dictation:cancel', async () => {
+    if (activeSessionMode !== 'dictation' && !sessionTransitionPromise) return { ok: false };
+    dictationHotkeyPressed = false;
+    dictationOverlaySuppressed = true;
+    dictationStartToken += 1;
+    dictationSnapshotPending = false;
+    pendingDictationPasteTarget = null;
+    if (activeSessionId) cancelledDictationSessions.add(activeSessionId);
+    hideDictationOverlayNow();
+    // A session that is still starting cannot be stopped yet; wait for it, then discard it.
+    if (sessionTransitionPromise) await sessionTransitionPromise.catch(() => {});
+    if (activeSessionMode === 'dictation') {
+      if (activeSessionId) cancelledDictationSessions.add(activeSessionId);
+      pendingDictationCancel = true;
+      await stopDictationFromHotkey();
+      hideDictationOverlayNow();
+    }
     return { ok: true };
   });
   ipcMain.handle('dictation:stop-hotkey-test', () => {
@@ -2342,6 +2379,7 @@ app.whenReady().then(() => {
     return runMeetingReportExport(request);
   });
   ipcMain.handle('translation:status', (_event, source: string, target: string, model: string) => prepareAppleTranslation(source, target, false, model));
+  ipcMain.handle('intelligence:status', () => runAppleIntelligence(getAppleIntelligencePath()));
   ipcMain.handle('translation:prepare', (_event, source: string, target: string, model: string) => prepareAppleTranslation(source, target, true, model));
   ipcMain.handle('permissions:check-microphone', () => ({ granted: systemPreferences.getMediaAccessStatus('microphone') === 'granted' }));
   ipcMain.handle('permissions:request-microphone', async () => {

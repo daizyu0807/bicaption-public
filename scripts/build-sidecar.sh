@@ -52,6 +52,7 @@ LOCAL_LLM_REWRITE_FLAG=""
 MLX_FLAGS=()
 MLX_LM_FLAGS=()
 BREEZE_ASR_FLAGS=()
+TRANSCRIBE_CPP_FLAGS=()
 
 if bicaption_include_local_llm; then
   LOCAL_LLM_HIDDEN_IMPORTS=(
@@ -138,6 +139,26 @@ else
   BREEZE_ASR_FLAGS=(--exclude-module mlx_whisper)
 fi
 
+# transcribe.cpp finds its native library through the "transcribe_cpp.native" entry point of the
+# transcribe-cpp-native distribution, so the package metadata must travel with the code and the dylibs.
+if bicaption_include_transcribe_cpp; then
+  if "$VENV_PYTHON" -c "import transcribe_cpp, transcribe_cpp_native" 2>/dev/null; then
+    TRANSCRIBE_CPP_FLAGS=(
+      --hidden-import transcribe_cpp
+      --hidden-import transcribe_cpp_native
+      --collect-all transcribe_cpp
+      --collect-all transcribe_cpp_native
+      --copy-metadata transcribe-cpp
+      --copy-metadata transcribe-cpp-native
+    )
+    echo "[build-sidecar] Including transcribe.cpp runtime (Breeze ASR GGUF, Qwen3-ASR)"
+  else
+    echo "[build-sidecar] WARNING: transcribe-cpp is not installed in the build venv; Breeze GGUF and Qwen3 will be unavailable in the packaged build"
+  fi
+else
+  TRANSCRIBE_CPP_FLAGS=(--exclude-module transcribe_cpp --exclude-module transcribe_cpp_native)
+fi
+
 # Ensure apple-stt binary exists
 APPLE_STT="$PYTHON_DIR/apple-stt"
 APPLE_STT_FLAG=""
@@ -190,6 +211,7 @@ set +u
   "${MLX_FLAGS[@]}" \
   "${MLX_LM_FLAGS[@]}" \
   "${BREEZE_ASR_FLAGS[@]}" \
+  "${TRANSCRIBE_CPP_FLAGS[@]}" \
   $SHERPA_COLLECT \
   $SHERPA_NATIVE \
   $APPLE_STT_FLAG \
@@ -220,6 +242,11 @@ PY
     touch "$PYTHON_DIR/dist/bicaption-sidecar/breeze-asr-runtime.enabled"
   else
     rm -f "$PYTHON_DIR/dist/bicaption-sidecar/breeze-asr-runtime.enabled"
+  fi
+  if [ ${#TRANSCRIBE_CPP_FLAGS[@]} -gt 0 ] && [[ "${TRANSCRIBE_CPP_FLAGS[0]}" == "--hidden-import" ]]; then
+    touch "$PYTHON_DIR/dist/bicaption-sidecar/transcribe-runtime.enabled"
+  else
+    rm -f "$PYTHON_DIR/dist/bicaption-sidecar/transcribe-runtime.enabled"
   fi
   echo "[build-sidecar] Success: $BINARY"
   du -sh "$PYTHON_DIR/dist/bicaption-sidecar/"

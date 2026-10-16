@@ -4,6 +4,9 @@ export interface AudioDeviceOption {
   kind: string;
 }
 
+/** Dictation records from whatever macOS currently uses as the default input; the sidecar resolves it on every start. */
+export const SYSTEM_DEFAULT_DEVICE_ID = '__system_default__';
+
 export function isInputDevice(device: AudioDeviceOption) {
   return device.kind === 'input' || device.kind === 'duplex';
 }
@@ -45,4 +48,12 @@ export function pickPreferredInputDevice(devices: AudioDeviceOption[]) {
       }
       return left.index - right.index;
     })[0]?.device ?? null;
+}
+
+/** Keep an explicit choice only while that input still exists; otherwise follow the system default. */
+export function resolveDictationDeviceId(stored: string, devices: AudioDeviceOption[]) {
+  if (!stored || stored === SYSTEM_DEFAULT_DEVICE_ID) {
+    return SYSTEM_DEFAULT_DEVICE_ID;
+  }
+  return devices.some((device) => isInputDevice(device) && device.id === stored) ? stored : SYSTEM_DEFAULT_DEVICE_ID;
 }

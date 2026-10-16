@@ -4,6 +4,7 @@ type SubscribeMap = {
   'sidecar:event': SidecarEvent;
   'dictation:hotkey-event': DictationHotkeyEvent;
   'dictation:output-status': DictationOutputStatusEvent;
+  'dictation:starting': Record<string, never>;
   'overlay:mode': { mode: 'hidden' | 'subtitle' | 'dictation' | 'preview' };
   'settings:changed': AppSettings;
   'models:progress': ModelDownloadProgress;
@@ -37,6 +38,7 @@ declare global {
       chooseSaveDirectory(): Promise<string | null>;
       openSaveDirectory(directory?: string): Promise<{ ok: boolean }>;
       checkAppleTranslation(source: string, target: string, model?: string): Promise<import('../electron/types.js').AppleTranslationStatus>;
+      checkAppleIntelligence(): Promise<import('../electron/types.js').AppleIntelligenceReply>;
       prepareAppleTranslation(source: string, target: string, model?: string): Promise<import('../electron/types.js').AppleTranslationStatus>;
       checkMicrophonePermission(): Promise<{ granted: boolean }>;
       requestMicrophonePermission(): Promise<{ granted: boolean }>;
@@ -56,6 +58,8 @@ declare global {
       openScreenRecordingSettings(): Promise<{ ok: boolean }>;
       testDictationHotkey(binding: DictationHotkeyBinding): Promise<{ ok: boolean }>;
       stopDictationHotkeyTest(): Promise<{ ok: boolean }>;
+      confirmDictation(): Promise<{ ok: boolean }>;
+      cancelDictation(): Promise<{ ok: boolean }>;
       deleteModel(modelKey: string): Promise<ModelStatus>;
       enrollMeetingLocalSpeaker(request: MeetingEnrollSpeakerRequest): Promise<MeetingEnrollSpeakerResult>;
       generateMeetingCopilotInsights(request: MeetingCopilotInsightsRequest): Promise<MeetingCopilotInsightsResult>;

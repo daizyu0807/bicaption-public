@@ -15,6 +15,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import atexit
+import gc
 import time
 import uuid
 import urllib.error
@@ -28,6 +30,7 @@ import numpy as np
 import sounddevice as sd
 from opencc import OpenCC
 import sherpa_onnx
+from apple_helper_launch import launch_apple_helper
 
 SAMPLE_RATE = 16_000
 CHANNELS = 1
@@ -36,9 +39,6 @@ SHORT_SEGMENT_WORDS = 4
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_BASE_DIR = os.environ.get("BICAPTION_MODEL_DIR", SCRIPT_DIR)
 SENSEVOICE_MODEL_DIR = os.path.join(MODEL_BASE_DIR, "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
-WHISPER_TINY_EN_MODEL_DIR = os.path.join(MODEL_BASE_DIR, "sherpa-onnx-whisper-tiny.en")
-WHISPER_SMALL_MODEL_DIR = os.path.join(MODEL_BASE_DIR, "sherpa-onnx-whisper-small")
-ZIPFORMER_KOREAN_MODEL_DIR = os.path.join(MODEL_BASE_DIR, "sherpa-onnx-zipformer-korean-2024-06-24")
 SILERO_VAD_MODEL = os.path.join(MODEL_BASE_DIR, "silero_vad.onnx")
 # Prefer the .app-bundled binary so ScreenCaptureKit's XPC connection stays
 # alive (bare CLI binaries get "application connection interrupted" on macOS 15+).
@@ -64,8 +64,6 @@ if getattr(sys, "frozen", False):
     LOCAL_LLM_REWRITE_BIN = os.path.join(sys._MEIPASS, "local-llm-rewrite.py")
 else:
     LOCAL_LLM_REWRITE_BIN = os.path.join(SCRIPT_DIR, "local-llm-rewrite.py")
-MOONSHINE_CACHE_DIR = os.path.join(MODEL_BASE_DIR, "moonshine_voice")
-MLX_WHISPER_MODEL = os.environ.get("BICAPTION_MLX_WHISPER_MODEL", "mlx-community/whisper-large-v3-turbo")
 BREEZE_ASR_MODEL_ID = "Kenji8000/Breeze-ASR-25-mlx"
 BREEZE_ASR_MODEL_REVISION = "56b8508317e7766d904d1f0b8cc612687dfa39a4"
 BREEZE_ASR_TIMEOUT_SECONDS = max(10, int(os.environ.get("BICAPTION_BREEZE_ASR_TIMEOUT_SECONDS", "120")))
@@ -105,6 +103,32 @@ def trace_debug(message: str) -> None:
             handle.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} [python-sidecar] {message}\n")
     except OSError:
         return
+
+
+DICTATION_AUDIO_DIR_ENV = "BICAPTION_SAVE_DICTATION_AUDIO_DIR"
+
+
+def maybe_save_dictation_debug_audio(session_id: str, audio: np.ndarray, literal_text: str) -> str | None:
+    """Opt-in debugging aid: keep what the microphone heard so a mis-recognition can be replayed through other engines.
+    Does nothing unless BICAPTION_SAVE_DICTATION_AUDIO_DIR is set; files never leave the machine."""
+    directory = os.environ.get(DICTATION_AUDIO_DIR_ENV, "").strip()
+    if not directory or audio is None or audio.size == 0:
+        return None
+    try:
+        os.makedirs(directory, exist_ok=True)
+        stem = os.path.join(directory, f"{time.strftime('%Y%m%d-%H%M%S')}-{session_id[:8]}")
+        pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
+        with wave.open(stem + ".wav", "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(SAMPLE_RATE)
+            handle.writeframes(pcm.tobytes())
+        with open(stem + ".json", "w", encoding="utf-8") as handle:
+            json.dump({"session": session_id, "literal": literal_text, "seconds": audio.size / SAMPLE_RATE}, handle, ensure_ascii=False)
+        return stem + ".wav"
+    except OSError as error:
+        trace_debug(f"saving dictation debug audio failed: {error}")
+        return None
 
 
 def _truncate_trace_text(text: str, limit: int = 80) -> str:
@@ -426,20 +450,6 @@ def make_meeting_segment_id(source: str, segment_id: str) -> str:
     return f"{normalized_source}:{normalized_segment_id}"
 
 
-def normalize_moonshine_lang(source_lang: str) -> str | None:
-    normalized = source_lang.lower()
-    if normalized in {"en", "english"}:
-        return "en"
-    if normalized in {"zh", "zh-cn", "zh-tw", "zh-hant", "chinese"}:
-        return "zh"
-    if normalized in {"ja", "japanese"}:
-        return "ja"
-    if normalized in {"ko", "korean"}:
-        return "ko"
-    if normalized == "auto":
-        return None
-    return None
-
 
 def normalize_mlx_whisper_lang(source_lang: str) -> str | None:
     normalized = source_lang.lower()
@@ -618,9 +628,8 @@ def should_attempt_dictation_batch_fallback(
     if dictation_parts or buffered_sample_count <= 0:
         return False
     
-    # For MLX Whisper, we always attempt if there is audio, 
-    # as it's our primary dictation engine and might have hallucinations even on quiet audio.
-    if stt_model.lower() in {"whisper-mlx", "groq-whisper"} or "mlx" in stt_model.lower():
+    # The cloud engine always attempts when there is audio: it can hallucinate even on quiet audio.
+    if stt_model.lower() == "groq-whisper":
         return buffered_sample_count >= (SAMPLE_RATE * 0.3) # At least 0.3s
         
     return max_input_level >= 0.05 # Lowered from 0.08
@@ -956,7 +965,38 @@ def list_audio_devices() -> list[dict[str, Any]]:
     return devices
 
 
+# Follow whatever macOS currently uses instead of a device picked once in settings.
+SYSTEM_DEFAULT_DEVICE_ID = "__system_default__"
+
+
+def refresh_audio_devices() -> None:
+    """PortAudio snapshots the device list when it is first used, so a device connected (or a default changed) later is
+    invisible until it is re-initialised. Only safe while no stream is open, i.e. at session start."""
+    try:
+        sd._terminate()
+        sd._initialize()
+    except Exception as error:
+        trace_debug(f"refresh_audio_devices failed: {error}")
+
+
+def resolve_system_default_device(require_input: bool) -> int | None:
+    refresh_audio_devices()
+    devices = sd.query_devices()
+    channel_key = "max_input_channels" if require_input else "max_output_channels"
+    try:
+        default_key = "default_input_device" if require_input else "default_output_device"
+        default_index = int(sd.query_hostapis(0).get(default_key, -1))
+        if 0 <= default_index < len(devices) and int(devices[default_index].get(channel_key, 0)) > 0:
+            trace_debug(f"following system default {'input' if require_input else 'output'}: {devices[default_index].get('name')}")
+            return default_index
+    except Exception as error:
+        trace_debug(f"system default device lookup failed: {error}")
+    return None
+
+
 def resolve_device(device_id: str, require_input: bool = True) -> int | None:
+    if device_id == SYSTEM_DEFAULT_DEVICE_ID:
+        return resolve_system_default_device(require_input)
     devices = sd.query_devices()
     channel_key = "max_input_channels" if require_input else "max_output_channels"
 
@@ -1035,6 +1075,8 @@ class SessionConfig:
     dictation_cloud_enhancement_enabled: bool = False
     dictation_output_style: str = "literal"
     dictation_initial_prompt_text: str = ""
+    dictation_dictionary_text: str = ""
+    dictation_hotwords: str = ""
     dictation_vocabulary_context: str = ""
     dictation_proper_noun_correction_enabled: bool = True
     dictation_personal_glossary: str = ""
@@ -1170,9 +1212,10 @@ def apply_dictation_dictionary(text: str, dictionary_entries: list[DictationDict
 
 
 def apply_cjk_spacing(text: str) -> str:
-    """Add a half-width space between CJK characters and Latin letters / digits."""
-    text = re.sub(r'([\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])([A-Za-z0-9])', r'\1 \2', text)
-    text = re.sub(r'([A-Za-z0-9])([\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])', r'\1 \2', text)
+    """Add a half-width space between CJK characters and Latin letters / digits. Full-width punctuation is not a CJK
+    letter: the old class included it and turned "refactor，然後" into "refactor ，然後"."""
+    text = re.sub(r'([\u3400-\u4dbf\u4e00-\u9fff])([A-Za-z0-9])', r'\1 \2', text)
+    text = re.sub(r'([A-Za-z0-9])([\u3400-\u4dbf\u4e00-\u9fff])', r'\1 \2', text)
     return text
 
 
@@ -1326,6 +1369,13 @@ def apply_lightweight_dictation_punctuation(text: str, source_lang: str, output_
                     punctuated,
                 )
                 continue
+            if rule.category == "statement-le-tail":
+                punctuated = re.sub(
+                    rf"({'|'.join(map(re.escape, rule.tokens))})(?=$|[\s]|{connector_hint})",
+                    rf"\1{rule.punctuation}",
+                    punctuated,
+                )
+                continue
             punctuated = re.sub(
                 rf"({'|'.join(map(re.escape, rule.tokens))})(?=$|[\s\u4e00-\u9fff])",
                 rf"\1{rule.punctuation}",
@@ -1361,6 +1411,8 @@ def apply_dictation_rules_rewrite(text: str, source_lang: str = "auto", output_s
     rewritten = normalize_text(text)
     if not rewritten:
         return ""
+    # Sentence-final periods are dropped on purpose, but a final ? or ! carries meaning and must survive.
+    final_mark = re.search(r"([？?！!])\s*$", rewritten)
     deterministic_replacements = [
         ("罪字", "贅字"),
         ("標底符號", "標點符號"),
@@ -1387,6 +1439,11 @@ def apply_dictation_rules_rewrite(text: str, source_lang: str = "auto", output_s
     rewritten = re.sub(r"\s+", " ", rewritten).strip(" ,.;:!?，。！？；：")
     rewritten = apply_lightweight_dictation_punctuation(rewritten, source_lang, output_style)
     rewritten = re.sub(r"啊(?=[^\s，。！？；：,])", "啊 ", rewritten)
+    if final_mark and rewritten:
+        rewritten = rewritten.rstrip(" ,.;:，。；：？?！!") + final_mark.group(1)
+    else:
+        # The punctuation pass can put a period back after a final 了; the convention is no sentence-final period.
+        rewritten = rewritten.rstrip(" ，。；：")
     return normalize_text(rewritten)
 
 
@@ -1404,6 +1461,10 @@ def should_accept_rewrite(
         return False, "rewrite_empty"
     if len(rewritten_compact) > max(1, math.ceil(len(base_compact) * max_expansion_ratio)):
         return False, "rewrite_expanded_too_much"
+    # A small model sometimes answers with a fragment of the prompt ("enabled", "disabled") instead of the text. Cleanup
+    # never legitimately drops more than about 60% of a dictation, so such answers are not a rewrite.
+    if rewritten_compact.lower() in {"enabled", "disabled", "none", "- none"} or len(rewritten_compact) < len(re.sub(r"<<dictation-[a-z-]+>>", "", base_compact)) * 0.4:
+        return False, "rewrite_too_short"
     rewritten_lower = rewritten_compact.lower()
     for term in protected_terms:
         if term and term.lower() not in rewritten_lower:
@@ -1605,12 +1666,20 @@ def extract_rewrite_text(content: Any) -> str:
     return raw
 
 
+def cloud_llm_reasoning_options(model: str, max_tokens: int) -> dict[str, Any]:
+    """gpt-oss models reason before answering and the reasoning counts against max_tokens, so a 48-160 token cap yields an
+    empty reply. Keep the reasoning short and leave room for the answer."""
+    if "gpt-oss" in model.lower():
+        return {"reasoning_effort": "low", "max_tokens": max_tokens + 1024}
+    return {"max_tokens": max_tokens}
+
+
 def resolve_cloud_llm_model(model: str, source_lang: str, output_style: str) -> str:
     candidate = (model or "").strip()
     if candidate and candidate.lower() != "auto":
         return candidate
     # Product default: prioritize the most stable non-reasoning rewrite model.
-    return "llama-3.3-70b-versatile"
+    return "openai/gpt-oss-120b"
 
 
 def get_local_llm_python_bin() -> str:
@@ -1901,7 +1970,7 @@ class CloudLlmRewriteProvider(DictationRewriteProvider):
         json_request_payload = {
             "model": model,
             "temperature": 0.1,
-            "max_tokens": get_local_llm_max_tokens(text),
+            **cloud_llm_reasoning_options(model, get_local_llm_max_tokens(text)),
             "response_format": {"type": "json_object"},
             "messages": [
                 {
@@ -1926,7 +1995,7 @@ class CloudLlmRewriteProvider(DictationRewriteProvider):
         text_request_payload = {
             "model": model,
             "temperature": 0.1,
-            "max_tokens": get_local_llm_max_tokens(text),
+            **cloud_llm_reasoning_options(model, get_local_llm_max_tokens(text)),
             "messages": [
                 {
                     "role": "system",
@@ -1999,6 +2068,28 @@ def get_dictation_rewrite_provider(rewrite_mode: str) -> DictationRewriteProvide
     return None
 
 
+def _apple_stt_fallback_for_missing_models(config: SessionConfig):
+    """A fresh install defaults to Breeze, whose model file is placed by hand, and SenseVoice has to be downloaded.
+    When neither is there, Apple speech recognition (no download, needs a fixed locale) keeps dictation working."""
+    if config.mode != "dictation" or config.source_lang == "auto":
+        return None
+    if os.path.isfile(os.path.join(SENSEVOICE_MODEL_DIR, "model.int8.onnx")) or not os.path.isfile(APPLE_STT_BIN):
+        return None
+    emit({
+        "type": "error",
+        "code": "apple_stt_fallback",
+        "message": "Breeze 與 SenseVoice 模型都尚未安裝，這次改用 Apple 語音辨識。",
+        "recoverable": True,
+    })
+    try:
+        transcriber = AppleSttTranscriber(source_lang=config.source_lang, partial_stable_ms=config.partial_stable_ms)
+        transcriber.start()
+        return transcriber
+    except Exception as error:
+        trace_debug(f"apple-stt fallback failed error={error}")
+        return None
+
+
 def get_streaming_transcriber(config: SessionConfig, announce: bool = True):
     if config.stt_model == "groq-whisper":
         if not (config.dictation_cloud_api_key or "").strip():
@@ -2011,13 +2102,6 @@ def get_streaming_transcriber(config: SessionConfig, announce: bool = True):
             initial_prompt=config.dictation_initial_prompt_text if config.mode == "dictation" else "",
             vocabulary_context=config.dictation_vocabulary_context if config.mode == "dictation" else "",
             personal_glossary=config.dictation_personal_glossary if config.mode == "dictation" else "",
-        )
-    if config.stt_model == "whisper-mlx":
-        if announce:
-            emit({"type": "session_state", "state": "connecting", "detail": "Preparing MLX Whisper batch provider..."})
-        return MlxWhisperBatchTranscriber(
-            source_lang=config.source_lang,
-            initial_prompt=config.dictation_initial_prompt_text if config.mode == "dictation" else "",
         )
     if config.stt_model == "breeze-asr-25":
         if config.mode == "meeting":
@@ -2035,46 +2119,64 @@ def get_streaming_transcriber(config: SessionConfig, announce: bool = True):
             source_lang=config.source_lang,
             initial_prompt=config.dictation_initial_prompt_text,
         )
-    if config.stt_model == "moonshine":
+    if config.stt_model == "apple-stt":
         if announce:
-            emit({"type": "session_state", "state": "connecting", "detail": "Preparing Moonshine streaming provider..."})
+            emit({"type": "session_state", "state": "connecting", "detail": "Starting Apple Speech Recognition..."})
+        contextual_strings = build_qwen3_vocabulary(
+            config.dictation_initial_prompt_text, config.dictation_dictionary_text, hotwords=config.dictation_hotwords,
+        ) if config.mode == "dictation" else []
+        transcriber = AppleSttTranscriber(
+            source_lang=config.source_lang,
+            partial_stable_ms=config.partial_stable_ms,
+            contextual_strings=contextual_strings,
+        )
+        transcriber.start()
+        return transcriber
+    if announce:
+        emit({"type": "session_state", "state": "connecting", "detail": "Loading SenseVoice model..."})
+    if config.stt_model == "breeze-gguf":
+        if announce:
+            emit({"type": "session_state", "state": "connecting", "detail": "Loading Breeze ASR model..."})
         try:
-            return MoonshineTranscriber(source_lang=config.source_lang, update_interval_ms=config.partial_stable_ms)
+            return SenseVoiceTranscriber(
+                min_silence_duration=config.partial_stable_ms / 1000.0,
+                session=get_breeze_gguf_model().new_session(),
+            )
         except Exception as error:
             emit({
                 "type": "error",
-                "code": "moonshine_fallback",
-                "message": f"Moonshine unavailable for this session, falling back to SenseVoice: {error}",
+                "code": "breeze_gguf_unavailable",
+                "message": f"Breeze 輕量版無法使用，這次改用 SenseVoice：{error}",
+                "recoverable": True,
+            })
+            apple_fallback = _apple_stt_fallback_for_missing_models(config)
+            if apple_fallback is not None:
+                return apple_fallback
+            if announce:
+                emit({"type": "session_state", "state": "connecting", "detail": "Falling back to SenseVoice..."})
+    if config.stt_model == "qwen3-asr":
+        if announce:
+            emit({"type": "session_state", "state": "connecting", "detail": "Loading Qwen3-ASR model..."})
+        try:
+            vocabulary = build_qwen3_vocabulary(
+                config.dictation_initial_prompt_text, config.dictation_dictionary_text, hotwords=config.dictation_hotwords)
+            return SenseVoiceTranscriber(
+                min_silence_duration=config.partial_stable_ms / 1000.0,
+                session=get_qwen3_model().new_session(vocabulary),
+            )
+        except Exception as error:
+            emit({
+                "type": "error",
+                "code": "qwen3_asr_unavailable",
+                "message": f"Qwen3-ASR 無法使用，這次改用 SenseVoice：{error}",
                 "recoverable": True,
             })
             if announce:
                 emit({"type": "session_state", "state": "connecting", "detail": "Falling back to SenseVoice..."})
-            return SenseVoiceTranscriber(min_silence_duration=config.partial_stable_ms / 1000.0)
-    if config.stt_model == "apple-stt":
-        if announce:
-            emit({"type": "session_state", "state": "connecting", "detail": "Starting Apple Speech Recognition..."})
-        transcriber = AppleSttTranscriber(
-            source_lang=config.source_lang,
-            partial_stable_ms=config.partial_stable_ms,
-        )
-        transcriber.start()
-        return transcriber
-    if config.stt_model == "whisper-tiny-en":
-        if announce:
-            emit({"type": "session_state", "state": "connecting", "detail": "Loading Whisper tiny.en model..."})
-        return WhisperTinyEnTranscriber()
-    if config.stt_model == "whisper-small":
-        lang = config.source_lang if config.source_lang != "auto" else ""
-        if announce:
-            emit({"type": "session_state", "state": "connecting", "detail": "Loading Whisper small model..."})
-        return WhisperSmallTranscriber(language=lang)
-    if config.stt_model == "zipformer-ko":
-        if announce:
-            emit({"type": "session_state", "state": "connecting", "detail": "Loading Zipformer Korean model..."})
-        return ZipformerKoreanTranscriber()
-    if announce:
-        emit({"type": "session_state", "state": "connecting", "detail": "Loading SenseVoice model..."})
-    return SenseVoiceTranscriber(min_silence_duration=config.partial_stable_ms / 1000.0)
+    vocabulary = None
+    if config.mode == "dictation" and config.stt_model != "qwen3-asr":
+        vocabulary = build_qwen3_vocabulary(config.dictation_initial_prompt_text, config.dictation_dictionary_text, hotwords=config.dictation_hotwords)
+    return SenseVoiceTranscriber(min_silence_duration=config.partial_stable_ms / 1000.0, vocabulary=vocabulary)
 
 
 @dataclass
@@ -2117,12 +2219,14 @@ DICTATION_TAIL_PUNCTUATION_RULES: tuple[DictationPunctuationRule, ...] = (
     DictationPunctuationRule("soft-tail", "tail", ("吧",), "，"),
     DictationPunctuationRule("exclaim-tail", "tail", ("嘍", "囉"), "！"),
     DictationPunctuationRule("question-soft-tail", "tail", ("呢",), "？"),
-    DictationPunctuationRule("statement-tail", "tail", ("了", "啦", "喔", "哦"), "。"),
+    DictationPunctuationRule("statement-tail", "tail", ("啦", "喔", "哦"), "。"),
+    # 了 also sits inside a clause ("去了公司", "調整了什麼"), so it only ends a sentence at the end or before a connector.
+    DictationPunctuationRule("statement-le-tail", "tail", ("了",), "。"),
 )
 
 DICTATION_HEAD_PUNCTUATION_RULES: tuple[DictationPunctuationRule, ...] = (
     DictationPunctuationRule("turn-head", "head", ("但", "但是", "不過", "所以", "因此", "然後", "另外", "而且", "最後", "接著", "可是", "因為"), "，"),
-    DictationPunctuationRule("list-head", "head", ("第一個", "第二個", "第三個", "第一點", "第二點", "第三點", "另外一個", "另一個", "還有", "接下來"), "，"),
+    DictationPunctuationRule("list-head", "head", ("第一個", "第二個", "第三個", "第一點", "第二點", "第三點", "另外一個", "另一個", "接下來"), "，"),
 )
 
 
@@ -2138,124 +2242,40 @@ class MeetingChunk:
     speaker_match_confidence: float = 0.0
 
 
-class MlxWhisperBatchTranscriber:
-    """Legacy-not-packaged MLX Whisper batch transcriber.
 
-    UI/settings no longer expose `whisper-mlx`; keep this lazy-import path only
-    as transitional runtime code until the full sidecar cleanup step removes it.
-    """
+def run_transcribe_probe(model_path: str = "", audio_path: str = "") -> dict[str, Any]:
+    """Packaging check: can this build load transcribe.cpp (and, given a GGUF and a WAV, really recognise speech)?
+    Used by scripts/verify-app-artifact.sh against the packaged sidecar."""
+    try:
+        import transcribe_cpp
+    except Exception as error:  # noqa: BLE001 - the probe reports, it never raises
+        return {"ok": False, "stage": "import", "error": f"{type(error).__name__}: {error}"}
+    result: dict[str, Any] = {"ok": True, "stage": "import", "provider": None}
+    try:
+        from transcribe_cpp import _library
 
-    """Batch-only dictation transcriber backed by MLX Whisper using subprocess isolation."""
-
-    _probe_result: bool | None = None
-
-    def __init__(self, source_lang: str = "auto", initial_prompt: str = "") -> None:
-        self.finalized_ids: set[str] = set()
-        self._segment_counter = 0
-        self._source_lang = normalize_mlx_whisper_lang(source_lang)
-        self._initial_prompt = normalize_text(initial_prompt)
-
-    def feed_audio(self, samples: np.ndarray, base_time_ms: int) -> list[TranscriptChunk]:
-        return []
-
-    def flush(self, base_time_ms: int) -> list[TranscriptChunk]:
-        return []
-
-    def stop(self) -> None:
-        return
-
-    @classmethod
-    def _probe_runtime_ready(cls) -> bool:
-        if cls._probe_result is not None:
-            return cls._probe_result
+        result["provider"] = _library.selected_provider()
+    except Exception:  # noqa: BLE001
+        pass
+    if not model_path:
+        return result
+    try:
+        transcribe_cpp.set_log_callback(_route_native_log)
+        model = transcribe_cpp.Model(model_path)
         try:
-            command = [*get_sidecar_invocation_command(), "--mlx-whisper-probe"]
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=8,
-                check=False,
-                env=build_child_process_env(),
-            )
-            cls._probe_result = result.returncode == 0 and "READY" in result.stdout
-        except Exception as exc:
-            cls._probe_result = False
-            trace_debug(f"mlx whisper probe exception={exc}")
-        return cls._probe_result
+            result["stage"] = "load"
+            if audio_path:
+                import wave
 
-    def transcribe_buffer(self, audio: np.ndarray, base_time_ms: int) -> list[TranscriptChunk]:
-        if audio.size < (SAMPLE_RATE * 0.3):
-            return []
-        if not self._probe_runtime_ready():
-            return []
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
-            temp_path = handle.name
-            
-        try:
-            pcm16 = np.clip(audio, -1.0, 1.0)
-            pcm16 = (pcm16 * 32767).astype(np.int16)
-            with wave.open(temp_path, "wb") as wav_file:
-                wav_file.setnchannels(CHANNELS)
-                wav_file.setsampwidth(2)
-                wav_file.setframerate(SAMPLE_RATE)
-                wav_file.writeframes(pcm16.tobytes())
-                
-            command = [*get_sidecar_invocation_command(), "--mlx-whisper-transcribe", "--audio-path", temp_path]
-            if self._source_lang and self._source_lang != "auto":
-                command.extend(["--source-lang", self._source_lang])
-            if self._initial_prompt:
-                command.extend(["--initial-prompt", self._initial_prompt])
-                
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
-                env=build_child_process_env(),
-            )
-            
-            if result.returncode != 0:
-                trace_debug(f"MLX worker failed: {result.stderr.strip() or result.stdout.strip()}")
-                return []
-            
-            # Use explicit markers for robust JSON extraction
-            stdout_content = result.stdout
-            match = re.search(r"MLX_JSON_START\n(.*?)\nMLX_JSON_END", stdout_content, re.DOTALL)
-            if not match:
-                return []
-
-            try:
-                payload = json.loads(match.group(1))
-            except json.JSONDecodeError:
-                return []
-
-            text = normalize_text(str(payload.get("text", "")))
-            detected_lang = normalize_text(str(payload.get("language", self._source_lang or "")))
-            
+                with wave.open(audio_path) as handle:
+                    samples = np.frombuffer(handle.readframes(handle.getnframes()), dtype=np.int16).astype(np.float32) / 32768
+                result["text"] = model.session().run(samples, language="zh").text
+                result["stage"] = "recognise"
         finally:
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-
-        if not text:
-            return []
-
-        self._segment_counter += 1
-        duration_ms = int(audio.size / SAMPLE_RATE * 1000)
-        return [TranscriptChunk(
-            mode=_emit_context["mode"],
-            session_id=_emit_context["sessionId"],
-            segment_id=f"mlx-whisper-{self._segment_counter}",
-            source_text=text,
-            started_at_ms=base_time_ms,
-            ended_at_ms=base_time_ms + duration_ms,
-            confidence=0.0,
-            detected_lang=detected_lang,
-        )]
+            model.close()
+    except Exception as error:  # noqa: BLE001
+        return {"ok": False, "stage": result["stage"], "error": f"{type(error).__name__}: {error}"}
+    return result
 
 
 def get_breeze_asr_model_path() -> str:
@@ -2784,18 +2804,420 @@ MAX_SPEECH_SECONDS = 10.0  # Force segment split for multi-speaker scenarios
 MIN_SPEECH_SAMPLES = int(SAMPLE_RATE * 0.3)  # Ignore segments shorter than 0.3s
 
 
+_JUNK_TERMS = {"undefined", "null", "none"}
+
+
+def build_qwen3_vocabulary(initial_prompt_text: str, dictionary_text: str, limit: int = 100, hotwords: str = "") -> list[str]:
+    """Hot-words for Qwen3-ASR, in priority order (it weighs earlier terms more): the dedicated hot-word list, then the
+    comma-separated initial prompt terms, then the spellings the personal dictionary maps to (the left side of
+    'X <= wrong' and the right side of 'wrong => X'). Case-insensitive de-duplication keeps the first spelling;
+    settings written by older builds can contain the literal word 'undefined', which is dropped."""
+    candidates: list[str] = []
+    for source in (hotwords, initial_prompt_text):
+        for raw in (source or "").replace("\n", ",").split(","):
+            candidates.append(normalize_text(raw))
+    try:
+        candidates.extend(entry.canonical for entry in parse_dictation_dictionary(dictionary_text or ""))
+    except Exception as error:
+        trace_debug(f"qwen3 vocabulary: dictionary ignored ({error})")
+    seen: set[str] = set()
+    terms: list[str] = []
+    for term in candidates:
+        key = term.lower()
+        if not term or key in _JUNK_TERMS or key in seen:
+            continue
+        seen.add(key)
+        terms.append(term)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+_sensevoice_recognizer = None
+_sensevoice_recognizer_last_used = 0.0
+_sensevoice_recognizer_lock = threading.Lock()
+# The loaded recognizer holds ~730 MB of RAM, so it is dropped after this much idle time (the next press reloads in ~0.7s).
+STOP_CONSUMER_JOIN_SECONDS = float(os.environ.get("BICAPTION_STOP_CONSUMER_JOIN_SECONDS", "8"))
+SENSEVOICE_IDLE_TTL_SECONDS = float(os.environ.get("BICAPTION_SENSEVOICE_IDLE_SECONDS", "600"))
+# Experimental: BICAPTION_SENSEVOICE_BACKEND=gguf plus BICAPTION_SENSEVOICE_GGUF=<model.gguf> runs SenseVoice through
+# the transcribe.cpp Python binding (~60% less memory in the benchmark). Anything else keeps sherpa-onnx.
+SENSEVOICE_BACKEND_ENV = "BICAPTION_SENSEVOICE_BACKEND"
+SENSEVOICE_GGUF_PATH_ENV = "BICAPTION_SENSEVOICE_GGUF"
+# BICAPTION_SENSEVOICE_BACKEND=qwen3 plus BICAPTION_QWEN3_GGUF=<model.gguf> swaps the recogniser behind the same VAD for
+# Qwen3-ASR 0.6B, fed the personal vocabulary and a fixed Traditional-Chinese prompt. It is ~3x bigger in memory
+# (about 1 GB in use), so it is released after three idle minutes instead of ten.
+QWEN3_GGUF_PATH_ENV = "BICAPTION_QWEN3_GGUF"
+QWEN3_IDLE_TTL_SECONDS = float(os.environ.get("BICAPTION_QWEN3_IDLE_SECONDS", "180"))
+QWEN3_CONTEXT_PROMPT = "以下是台灣人用繁體中文口語說的話，常夾雜英文技術名詞。"
+
+
+class SherpaSenseVoiceSession:
+    """One transcriber's view of the shared sherpa-onnx recognizer."""
+
+    def __init__(self, recognizer) -> None:
+        self._recognizer = recognizer
+
+    def recognize(self, audio: np.ndarray) -> tuple[str, str]:
+        stream = self._recognizer.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, audio)
+        self._recognizer.decode_stream(stream)
+        result = stream.result
+        return result.text, result.lang
+
+
+class GgufSenseVoiceSession:
+    def __init__(self, session) -> None:
+        self._session = session
+
+    def recognize(self, audio: np.ndarray) -> tuple[str, str]:
+        result = self._session.run(np.asarray(audio, dtype=np.float32))
+        return result.text, result.language
+
+
+def _route_native_log(level: int, message: str) -> None:
+    """transcribe.cpp log levels: 1=info, 2=warn, 3=error, 4=debug. Only warnings and errors are kept."""
+    if level in (2, 3) and message.strip():
+        trace_debug(f"transcribe.cpp {'error' if level == 3 else 'warning'}: {message.strip()}")
+
+
+def _close_model_at_exit(model) -> None:
+    """Close a model at interpreter exit without keeping it alive: _close_model_at_exit(model) stores a bound method,
+    i.e. a strong reference, which made every idle release a no-op because the model could never be collected."""
+    import weakref
+
+    reference = weakref.ref(model)
+
+    def close() -> None:
+        target = reference()
+        if target is not None:
+            target.close()
+
+    atexit.register(close)
+
+
+class _SessionTracking:
+    """Remembers which sessions are still alive so an idle release never closes a model under a running dictation."""
+
+    def _track(self, session):
+        import weakref
+
+        if not hasattr(self, "_live_sessions"):
+            self._live_sessions = weakref.WeakSet()
+        self._live_sessions.add(session)
+        return session
+
+    def in_use(self) -> bool:
+        return len(getattr(self, "_live_sessions", ())) > 0
+
+
+class Qwen3AsrSession:
+    def __init__(self, session, vocabulary: list[str] | None) -> None:
+        self._session = session
+        self._options: dict[str, Any] = {"prompt": QWEN3_CONTEXT_PROMPT}
+        if vocabulary:
+            self._options["vocabulary"] = list(vocabulary)
+
+    def recognize(self, audio: np.ndarray) -> tuple[str, str]:
+        result = self._session.run(np.asarray(audio, dtype=np.float32), **self._options)
+        return result.text, result.language
+
+
+class Qwen3AsrModel(_SessionTracking):
+    """Qwen3-ASR through transcribe.cpp; one model, a session per transcriber carrying that session's vocabulary."""
+
+    def __init__(self, model_path: str) -> None:
+        import transcribe_cpp
+
+        transcribe_cpp.set_log_callback(_route_native_log)
+        self._model = transcribe_cpp.Model(model_path)
+
+    def new_session(self, vocabulary: list[str] | None = None) -> Qwen3AsrSession:
+        return self._track(Qwen3AsrSession(self._model.session(), vocabulary))
+
+    def close(self) -> None:
+        try:
+            self._model.close()
+        except Exception:
+            pass
+
+
+BREEZE_GGUF_PATH_ENV = "BICAPTION_BREEZE_GGUF"
+BREEZE_GGUF_IDLE_TTL_SECONDS = float(os.environ.get("BICAPTION_BREEZE_GGUF_IDLE_SECONDS", "180"))
+BREEZE_GGUF_LANGUAGE = "zh"  # Breeze ASR 25 is tuned for Taiwanese Mandarin with English terms; it ignores hot-words and prompts
+
+
+# Whisper-family models invent subtitle credits and sign-offs when a segment is only noise or silence.
+WHISPER_HALLUCINATION_PATTERN = re.compile(
+    r"^(?:(?:謝謝|感謝|多謝)(?:大家)?(?:您|你|各位)?(?:的)?(?:收看|觀看|收聽|觀賞|觀看本期|收看本期|聆聽)(?:本期)?(?:節目)?"
+    r"|(?:請|歡迎)?(?:不吝|多多)?(?:點贊|訂閱|按讚|訂閱我的頻道|訂閱本頻道|點讚訂閱)[^，。]*"
+    r"|(?:中文)?字幕(?:由|志願者|提供|製作|組)[^，。]*"
+    r"|(?:下集|下期|我們下(?:次|期|集))(?:再見|見)"
+    r"|(?:bye|goodbye|thank you(?: for watching)?|thanks for watching|subtitles? by[^，。]*|amara\.org[^，。]*))"
+    r"[\s，。！!？?、.]*$",
+    re.IGNORECASE,
+)
+
+
+def is_whisper_hallucination(text: str) -> bool:
+    """True for the stock phrases Whisper-family models emit on silence ("謝謝收看", "字幕由…提供", ...)."""
+    return bool(WHISPER_HALLUCINATION_PATTERN.match((text or "").strip()))
+
+
+class BreezeGgufSession:
+    def __init__(self, session) -> None:
+        self._session = session
+
+    def recognize(self, audio: np.ndarray) -> tuple[str, str]:
+        result = self._session.run(np.asarray(audio, dtype=np.float32), language=BREEZE_GGUF_LANGUAGE)
+        if is_whisper_hallucination(result.text):
+            trace_debug(f"Breeze GGUF dropped a silence hallucination: {result.text!r}")
+            return "", result.language
+        return result.text, result.language
+
+
+class BreezeGgufModel(_SessionTracking):
+    """Breeze ASR 25 (Whisper large-v2 tuned for Taiwanese Mandarin and code-switching) as a Q4 GGUF through transcribe.cpp."""
+
+    def __init__(self, model_path: str) -> None:
+        import transcribe_cpp
+
+        transcribe_cpp.set_log_callback(_route_native_log)
+        self._model = transcribe_cpp.Model(model_path)
+
+    def new_session(self, vocabulary: list[str] | None = None) -> BreezeGgufSession:
+        return self._track(BreezeGgufSession(self._model.session()))
+
+    def close(self) -> None:
+        try:
+            self._model.close()
+        except Exception:
+            pass
+
+
+class GgufSenseVoiceModel(_SessionTracking):
+    """transcribe.cpp model shared by every transcriber; each transcriber gets its own session."""
+
+    def __init__(self, model_path: str) -> None:
+        import transcribe_cpp
+
+        # Electron treats every stderr line as an error event, and ggml-metal logs dozens of lines while loading,
+        # so native logging goes to the trace file only. Must be installed before the model loads.
+        transcribe_cpp.set_log_callback(_route_native_log)
+        self._model = transcribe_cpp.Model(model_path)
+
+    def new_session(self, vocabulary: list[str] | None = None) -> GgufSenseVoiceSession:
+        return self._track(GgufSenseVoiceSession(self._model.session()))
+
+    def close(self) -> None:
+        # ggml-metal aborts the process at exit if a model is still open, so this also runs from atexit.
+        try:
+            self._model.close()
+        except Exception:
+            pass
+
+
+def _build_sensevoice_backend():
+    requested = os.environ.get(SENSEVOICE_BACKEND_ENV, "").strip().lower()
+    if requested == "qwen3":
+        model_path = os.environ.get(QWEN3_GGUF_PATH_ENV, "").strip()
+        try:
+            if not model_path or not os.path.isfile(model_path):
+                raise FileNotFoundError(f"{QWEN3_GGUF_PATH_ENV} does not point to a file: {model_path!r}")
+            backend = Qwen3AsrModel(model_path)
+            _close_model_at_exit(backend)
+            trace_debug(f"SenseVoice backend: qwen3 ({os.path.basename(model_path)})")
+            return backend
+        except Exception as error:  # a broken experiment must never take dictation down
+            trace_debug(f"Qwen3-ASR unavailable ({error}); falling back to sherpa-onnx")
+    elif requested == "gguf":
+        model_path = os.environ.get(SENSEVOICE_GGUF_PATH_ENV, "").strip()
+        try:
+            if not model_path or not os.path.isfile(model_path):
+                raise FileNotFoundError(f"{SENSEVOICE_GGUF_PATH_ENV} does not point to a file: {model_path!r}")
+            backend = GgufSenseVoiceModel(model_path)
+            _close_model_at_exit(backend)
+            trace_debug(f"SenseVoice backend: gguf ({os.path.basename(model_path)})")
+            return backend
+        except Exception as error:  # a broken experiment must never take dictation down
+            trace_debug(f"GGUF SenseVoice unavailable ({error}); falling back to sherpa-onnx")
+    return sherpa_onnx.OfflineRecognizer.from_sense_voice(
+        model=os.path.join(SENSEVOICE_MODEL_DIR, "model.int8.onnx"),
+        tokens=os.path.join(SENSEVOICE_MODEL_DIR, "tokens.txt"),
+        num_threads=2,
+        use_itn=True,
+        language="",  # auto-detect
+        debug=False,
+    )
+
+
+QWEN3_MODEL_FILE = "Qwen3-ASR-0.6B-Q4_K_M.gguf"
+_qwen3_model = None
+_qwen3_model_last_used = 0.0
+_qwen3_model_lock = threading.Lock()
+
+
+def qwen3_model_path() -> str:
+    """The model sits next to the other local models (BICAPTION_MODEL_DIR); the env var is only an override for tests."""
+    return os.environ.get(QWEN3_GGUF_PATH_ENV, "").strip() or os.path.join(MODEL_BASE_DIR, QWEN3_MODEL_FILE)
+
+
+def get_qwen3_model() -> "Qwen3AsrModel":
+    """Load the Qwen3-ASR model once and reuse it; raises RuntimeError with a readable reason when it cannot run."""
+    global _qwen3_model, _qwen3_model_last_used
+    with _qwen3_model_lock:
+        if _qwen3_model is None:
+            path = qwen3_model_path()
+            if not os.path.isfile(path):
+                raise RuntimeError(f"找不到 Qwen3-ASR 模型檔：{path}")
+            try:
+                model = Qwen3AsrModel(path)
+            except ImportError as error:
+                raise RuntimeError("Qwen3-ASR 需要 transcribe-cpp 套件") from error
+            _close_model_at_exit(model)
+            _qwen3_model = model
+            trace_debug(f"Qwen3-ASR engine loaded ({os.path.basename(path)})")
+        _qwen3_model_last_used = time.monotonic()
+        return _qwen3_model
+
+
+def release_idle_qwen3_model(ttl_seconds: float | None = None) -> bool:
+    """Close and drop the cached model (about 1 GB while in use) once it has been idle. A session that is still alive keeps
+    it open: the watchdog simply tries again on its next tick."""
+    global _qwen3_model
+    with _qwen3_model_lock:
+        if _qwen3_model is None:
+            return False
+        if time.monotonic() - _qwen3_model_last_used < (QWEN3_IDLE_TTL_SECONDS if ttl_seconds is None else ttl_seconds):
+            return False
+        if _qwen3_model.in_use():
+            return False
+        released, _qwen3_model = _qwen3_model, None
+    released.close()
+    del released
+    gc.collect()
+    return True
+
+
+def reset_qwen3_model_cache() -> None:
+    global _qwen3_model
+    with _qwen3_model_lock:
+        _qwen3_model = None
+
+
+BREEZE_GGUF_MODEL_FILE = "Breeze-ASR-25-Q4_K_M.gguf"
+_breeze_gguf_model = None
+_breeze_gguf_model_last_used = 0.0
+_breeze_gguf_model_lock = threading.Lock()
+
+
+def breeze_gguf_model_path() -> str:
+    return os.environ.get(BREEZE_GGUF_PATH_ENV, "").strip() or os.path.join(MODEL_BASE_DIR, BREEZE_GGUF_MODEL_FILE)
+
+
+def get_breeze_gguf_model() -> "BreezeGgufModel":
+    """Load the Breeze GGUF model once and reuse it; raises RuntimeError with a readable reason when it cannot run."""
+    global _breeze_gguf_model, _breeze_gguf_model_last_used
+    with _breeze_gguf_model_lock:
+        if _breeze_gguf_model is None:
+            path = breeze_gguf_model_path()
+            if not os.path.isfile(path):
+                raise RuntimeError(f"找不到 Breeze 模型檔：{path}")
+            try:
+                model = BreezeGgufModel(path)
+            except ImportError as error:
+                raise RuntimeError("Breeze 輕量版需要 transcribe-cpp 套件") from error
+            _close_model_at_exit(model)
+            _breeze_gguf_model = model
+            trace_debug(f"Breeze GGUF engine loaded ({os.path.basename(path)})")
+        _breeze_gguf_model_last_used = time.monotonic()
+        return _breeze_gguf_model
+
+
+def release_idle_breeze_gguf_model(ttl_seconds: float | None = None) -> bool:
+    """Close and drop the cached model (about 1.4 GB while in use) once idle; a live session keeps it open."""
+    global _breeze_gguf_model
+    with _breeze_gguf_model_lock:
+        if _breeze_gguf_model is None:
+            return False
+        if time.monotonic() - _breeze_gguf_model_last_used < (BREEZE_GGUF_IDLE_TTL_SECONDS if ttl_seconds is None else ttl_seconds):
+            return False
+        if _breeze_gguf_model.in_use():
+            return False
+        released, _breeze_gguf_model = _breeze_gguf_model, None
+    released.close()
+    del released
+    gc.collect()
+    return True
+
+
+def reset_breeze_gguf_model_cache() -> None:
+    global _breeze_gguf_model
+    with _breeze_gguf_model_lock:
+        _breeze_gguf_model = None
+
+
+def get_sensevoice_recognizer():
+    """Build the SenseVoice backend once and reuse it; loading it on every hotkey press cost ~0.9s."""
+    global _sensevoice_recognizer, _sensevoice_recognizer_last_used
+    with _sensevoice_recognizer_lock:
+        if _sensevoice_recognizer is None:
+            _sensevoice_recognizer = _build_sensevoice_backend()
+        _sensevoice_recognizer_last_used = time.monotonic()
+        return _sensevoice_recognizer
+
+
+def acquire_sensevoice_session(vocabulary: list[str] | None = None):
+    backend = get_sensevoice_recognizer()
+    if isinstance(backend, (GgufSenseVoiceModel, Qwen3AsrModel)):
+        return backend.new_session(vocabulary)
+    return SherpaSenseVoiceSession(backend)
+
+
+def release_idle_sensevoice_recognizer(ttl_seconds: float | None = None) -> bool:
+    """Drop the cached recognizer after ttl_seconds without a get (the Qwen3 model, ~1 GB, goes sooner than SenseVoice).
+    GGUF-backed models are closed explicitly and only once no session is alive; the sherpa recogniser is simply dropped."""
+    global _sensevoice_recognizer
+    with _sensevoice_recognizer_lock:
+        if _sensevoice_recognizer is None:
+            return False
+        if ttl_seconds is None:
+            ttl_seconds = QWEN3_IDLE_TTL_SECONDS if isinstance(_sensevoice_recognizer, Qwen3AsrModel) else SENSEVOICE_IDLE_TTL_SECONDS
+        if time.monotonic() - _sensevoice_recognizer_last_used < ttl_seconds:
+            return False
+        closable = isinstance(_sensevoice_recognizer, (GgufSenseVoiceModel, Qwen3AsrModel))
+        if closable and _sensevoice_recognizer.in_use():
+            return False
+        released, _sensevoice_recognizer = _sensevoice_recognizer, None
+    if closable:
+        released.close()
+    del released
+    gc.collect()
+    return True
+
+
+def _sensevoice_idle_watchdog() -> None:
+    while True:
+        time.sleep(60)
+        release_idle_sensevoice_recognizer()
+        release_idle_qwen3_model()
+        release_idle_breeze_gguf_model()
+
+
+def start_sensevoice_idle_watchdog() -> None:
+    threading.Thread(target=_sensevoice_idle_watchdog, name="sensevoice-idle-watchdog", daemon=True).start()
+
+
+def reset_sensevoice_recognizer_cache() -> None:
+    global _sensevoice_recognizer
+    with _sensevoice_recognizer_lock:
+        _sensevoice_recognizer = None
+
+
 class SenseVoiceTranscriber:
     """VAD + SenseVoice offline recognizer for near-realtime transcription."""
 
-    def __init__(self, min_silence_duration: float = 0.3) -> None:
-        self.recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-            model=os.path.join(SENSEVOICE_MODEL_DIR, "model.int8.onnx"),
-            tokens=os.path.join(SENSEVOICE_MODEL_DIR, "tokens.txt"),
-            num_threads=2,
-            use_itn=True,
-            language="",  # auto-detect
-            debug=False,
-        )
+    def __init__(self, min_silence_duration: float = 0.3, vocabulary: list[str] | None = None, session=None) -> None:
+        self.recognizer = session if session is not None else acquire_sensevoice_session(vocabulary)
         vad_config = sherpa_onnx.VadModelConfig()
         vad_config.silero_vad.model = SILERO_VAD_MODEL
         vad_config.silero_vad.min_silence_duration = max(0.12, min(1.2, float(min_silence_duration)))
@@ -2811,13 +3233,8 @@ class SenseVoiceTranscriber:
 
     def _recognize(self, audio: np.ndarray) -> tuple[str, str]:
         """Run SenseVoice on an audio segment, return (text, lang)."""
-        stream = self.recognizer.create_stream()
-        stream.accept_waveform(SAMPLE_RATE, audio)
-        self.recognizer.decode_stream(stream)
-        result = stream.result
-        text = normalize_text(result.text)
-        lang = parse_sensevoice_lang(result.lang)
-        return text, lang
+        raw_text, raw_lang = self.recognizer.recognize(audio)
+        return normalize_text(raw_text), parse_sensevoice_lang(raw_lang)
 
     def _process_vad_queue(self, base_time_ms: int) -> list[TranscriptChunk]:
         """Process all completed speech segments from VAD queue."""
@@ -2981,476 +3398,6 @@ class BreezeAsrMeetingTranscriber(BreezeAsrBatchTranscriber):
         return self._process_vad_queue(base_time_ms)
 
 
-class MoonshineTranscriber:
-    """Legacy-not-packaged Moonshine streaming transcriber.
-
-    UI/settings no longer expose `moonshine`; keep this lazy-import path only
-    as transitional runtime code until the full sidecar cleanup step removes it.
-    """
-
-    def __init__(self, source_lang: str = "auto", update_interval_ms: int = 500) -> None:
-        moonshine_lang = normalize_moonshine_lang(source_lang)
-        if moonshine_lang is None:
-            raise RuntimeError("Moonshine requires an explicit supported source language (en / zh / ja / ko).")
-
-        os.environ.setdefault("MOONSHINE_VOICE_CACHE", MOONSHINE_CACHE_DIR)
-        moonshine_voice = importlib.import_module("moonshine_voice")
-        transcriber_mod = importlib.import_module("moonshine_voice.transcriber")
-
-        ModelArch = moonshine_voice.ModelArch
-        get_model_for_language = moonshine_voice.get_model_for_language
-        self._line_completed_type = transcriber_mod.LineCompleted
-        self._line_updated_type = transcriber_mod.LineUpdated
-        self._line_text_changed_type = transcriber_mod.LineTextChanged
-        self._transcriber_cls = transcriber_mod.Transcriber
-
-        preferred_arch = ModelArch.SMALL_STREAMING if moonshine_lang == "en" else ModelArch.BASE
-        model_path, model_arch = get_model_for_language(moonshine_lang, preferred_arch)
-        self._detected_lang = moonshine_lang
-        self._session_base_ms = now_ms()
-        self._queued_chunks: list[TranscriptChunk] = []
-        self._seen_completed_line_ids: set[int] = set()
-        self._last_partial_by_line_id: dict[int, str] = {}
-        self.finalized_ids: set[str] = set()
-
-        update_interval = max(0.2, update_interval_ms / 1000.0)
-        self._transcriber = self._transcriber_cls(
-            model_path=str(model_path),
-            model_arch=model_arch,
-            update_interval=update_interval,
-        )
-        self._stream = self._transcriber.create_stream(update_interval=update_interval)
-        self._stream.add_listener(self._on_event)
-        self._stream.start()
-
-    def _line_to_chunk(self, line: Any) -> TranscriptChunk:
-        started_at_ms = self._session_base_ms + int(float(line.start_time) * 1000)
-        ended_at_ms = started_at_ms + int(float(line.duration) * 1000)
-        segment_id = f"moonshine-{line.line_id}"
-        return TranscriptChunk(
-            mode=_emit_context["mode"],
-            session_id=_emit_context["sessionId"],
-            segment_id=segment_id,
-            source_text=normalize_text(str(line.text)),
-            started_at_ms=started_at_ms,
-            ended_at_ms=ended_at_ms,
-            confidence=0.0,
-            detected_lang=self._detected_lang,
-        )
-
-    def _on_event(self, event: Any) -> None:
-        if isinstance(event, self._line_completed_type):
-            line = event.line
-            if line.line_id in self._seen_completed_line_ids:
-                return
-            self._seen_completed_line_ids.add(line.line_id)
-            self._last_partial_by_line_id.pop(int(line.line_id), None)
-            chunk = self._line_to_chunk(line)
-            if chunk.source_text:
-                self._queued_chunks.append(chunk)
-            return
-
-        if isinstance(event, self._line_updated_type) or isinstance(event, self._line_text_changed_type):
-            line = getattr(event, "line", None)
-            if line is None:
-                return
-            line_id = int(line.line_id)
-            if line_id in self._seen_completed_line_ids:
-                return
-            text = normalize_text(str(line.text))
-            if not text:
-                return
-            if self._last_partial_by_line_id.get(line_id) == text:
-                return
-            self._last_partial_by_line_id[line_id] = text
-            if _emit_context["mode"] == "subtitle":
-                emit({
-                    "type": "partial_caption",
-                    "mode": _emit_context["mode"],
-                    "sessionId": _emit_context["sessionId"],
-                    "segmentId": f"moonshine-{line_id}",
-                    "sourceText": text,
-                    "startedAtMs": self._session_base_ms + int(float(line.start_time) * 1000),
-                    "updatedAtMs": now_ms(),
-                })
-
-    def _drain_chunks(self) -> list[TranscriptChunk]:
-        if not self._queued_chunks:
-            return []
-        chunks = self._queued_chunks
-        self._queued_chunks = []
-        return chunks
-
-    def feed_audio(self, samples: np.ndarray, base_time_ms: int) -> list[TranscriptChunk]:
-        if samples.size == 0:
-            return []
-        self._stream.add_audio(samples.astype(np.float32).tolist(), sample_rate=SAMPLE_RATE)
-        return self._drain_chunks()
-
-    def flush(self, base_time_ms: int) -> list[TranscriptChunk]:
-        try:
-            self._stream.stop()
-        except Exception:
-            pass
-        return self._drain_chunks()
-
-    def stop(self) -> None:
-        try:
-            self._stream.close()
-        except Exception:
-            pass
-
-    def transcribe_buffer(self, audio: np.ndarray, base_time_ms: int) -> list[TranscriptChunk]:
-        temp_stream = self._transcriber.create_stream(update_interval=9999)
-        local_chunks: list[TranscriptChunk] = []
-
-        def listener(event: Any) -> None:
-            if isinstance(event, self._line_completed_type):
-                line = event.line
-                chunk = TranscriptChunk(
-                    mode=_emit_context["mode"],
-                    session_id=_emit_context["sessionId"],
-                    segment_id=f"moonshine-{line.line_id}",
-                    source_text=normalize_text(str(line.text)),
-                    started_at_ms=base_time_ms + int(float(line.start_time) * 1000),
-                    ended_at_ms=base_time_ms + int((float(line.start_time) + float(line.duration)) * 1000),
-                    confidence=0.0,
-                    detected_lang=self._detected_lang,
-                )
-                if chunk.source_text:
-                    local_chunks.append(chunk)
-
-        temp_stream.add_listener(listener)
-        temp_stream.start()
-        temp_stream.add_audio(audio.astype(np.float32).tolist(), sample_rate=SAMPLE_RATE)
-        try:
-            temp_stream.stop()
-        finally:
-            temp_stream.close()
-        return local_chunks
-
-
-class WhisperTinyEnTranscriber:
-    """VAD + Whisper tiny.en offline recognizer optimized for English."""
-
-    def __init__(self) -> None:
-        self.recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
-            encoder=os.path.join(WHISPER_TINY_EN_MODEL_DIR, "tiny.en-encoder.int8.onnx"),
-            decoder=os.path.join(WHISPER_TINY_EN_MODEL_DIR, "tiny.en-decoder.int8.onnx"),
-            tokens=os.path.join(WHISPER_TINY_EN_MODEL_DIR, "tiny.en-tokens.txt"),
-            language="en",
-            task="transcribe",
-            num_threads=2,
-            debug=False,
-        )
-        vad_config = sherpa_onnx.VadModelConfig()
-        vad_config.silero_vad.model = SILERO_VAD_MODEL
-        vad_config.silero_vad.min_silence_duration = 0.3
-        vad_config.silero_vad.min_speech_duration = 0.1
-        vad_config.silero_vad.max_speech_duration = MAX_SPEECH_SECONDS
-        vad_config.silero_vad.threshold = 0.25
-        vad_config.sample_rate = SAMPLE_RATE
-        self.vad = sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=60)
-        self.vad_window = 512
-        self._vad_buf = np.array([], dtype=np.float32)
-        self.finalized_ids: set[str] = set()
-        self._segment_counter = 0
-
-    def _recognize(self, audio: np.ndarray) -> tuple[str, str]:
-        stream = self.recognizer.create_stream()
-        stream.accept_waveform(SAMPLE_RATE, audio)
-        self.recognizer.decode_stream(stream)
-        text = normalize_text(stream.result.text)
-        return text, "en"
-
-    def _process_vad_queue(self, base_time_ms: int) -> list[TranscriptChunk]:
-        results: list[TranscriptChunk] = []
-        while not self.vad.empty():
-            speech = self.vad.front
-            speech_samples = np.array(speech.samples, dtype=np.float32)
-            self.vad.pop()
-
-            if len(speech_samples) < MIN_SPEECH_SAMPLES:
-                continue
-
-            text, lang = self._recognize(speech_samples)
-            if not text or len(text.replace(" ", "")) < 2:
-                continue
-
-            self._segment_counter += 1
-            duration_ms = int(len(speech_samples) / SAMPLE_RATE * 1000)
-            results.append(TranscriptChunk(
-                mode=_emit_context["mode"],
-                session_id=_emit_context["sessionId"],
-                segment_id=f"seg-{self._segment_counter}",
-                source_text=text,
-                started_at_ms=base_time_ms,
-                ended_at_ms=base_time_ms + duration_ms,
-                confidence=0.0,
-                detected_lang=lang,
-            ))
-        return results
-
-    def feed_audio(self, samples: np.ndarray, base_time_ms: int) -> list[TranscriptChunk]:
-        if samples.size == 0:
-            return []
-
-        self._vad_buf = np.concatenate([self._vad_buf, samples.reshape(-1)])
-
-        while len(self._vad_buf) >= self.vad_window:
-            chunk = self._vad_buf[:self.vad_window]
-            self._vad_buf = self._vad_buf[self.vad_window:]
-            self.vad.accept_waveform(chunk)
-
-        return self._process_vad_queue(base_time_ms)
-
-    def flush(self, base_time_ms: int) -> list[TranscriptChunk]:
-        if self._vad_buf.size > 0:
-            padded = np.pad(self._vad_buf, (0, max(0, self.vad_window - self._vad_buf.size % self.vad_window) % self.vad_window))
-            while padded.size > 0:
-                chunk = padded[:self.vad_window]
-                padded = padded[self.vad_window:]
-                self.vad.accept_waveform(chunk)
-            self._vad_buf = np.zeros(0, dtype=np.float32)
-        silence_windows = int(math.ceil(0.35 * SAMPLE_RATE / self.vad_window))
-        for _ in range(max(1, silence_windows)):
-            self.vad.accept_waveform(np.zeros(self.vad_window, dtype=np.float32))
-        return self._process_vad_queue(base_time_ms)
-
-    def transcribe_buffer(self, audio: np.ndarray, base_time_ms: int) -> list[TranscriptChunk]:
-        if audio.size < MIN_SPEECH_SAMPLES:
-            return []
-        text, lang = self._recognize(audio.astype(np.float32))
-        if not text or len(text.replace(" ", "")) < 2:
-            return []
-        self._segment_counter += 1
-        duration_ms = int(audio.size / SAMPLE_RATE * 1000)
-        return [TranscriptChunk(
-            mode=_emit_context["mode"],
-            session_id=_emit_context["sessionId"],
-            segment_id=f"seg-{self._segment_counter}",
-            source_text=text,
-            started_at_ms=base_time_ms,
-            ended_at_ms=base_time_ms + duration_ms,
-            confidence=0.0,
-            detected_lang=lang,
-        )]
-
-
-class WhisperSmallTranscriber:
-    """VAD + Whisper small multilingual recognizer for ja/ko and other languages."""
-
-    def __init__(self, language: str = "") -> None:
-        self.recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
-            encoder=os.path.join(WHISPER_SMALL_MODEL_DIR, "small-encoder.int8.onnx"),
-            decoder=os.path.join(WHISPER_SMALL_MODEL_DIR, "small-decoder.int8.onnx"),
-            tokens=os.path.join(WHISPER_SMALL_MODEL_DIR, "small-tokens.txt"),
-            language=language or "",
-            task="transcribe",
-            num_threads=2,
-            debug=False,
-        )
-        self._language = language
-        vad_config = sherpa_onnx.VadModelConfig()
-        vad_config.silero_vad.model = SILERO_VAD_MODEL
-        vad_config.silero_vad.min_silence_duration = 0.3
-        vad_config.silero_vad.min_speech_duration = 0.1
-        vad_config.silero_vad.max_speech_duration = MAX_SPEECH_SECONDS
-        vad_config.silero_vad.threshold = 0.25
-        vad_config.sample_rate = SAMPLE_RATE
-        self.vad = sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=60)
-        self.vad_window = 512
-        self._vad_buf = np.array([], dtype=np.float32)
-        self.finalized_ids: set[str] = set()
-        self._segment_counter = 0
-
-    def _recognize(self, audio: np.ndarray) -> tuple[str, str]:
-        stream = self.recognizer.create_stream()
-        stream.accept_waveform(SAMPLE_RATE, audio)
-        self.recognizer.decode_stream(stream)
-        text = normalize_text(stream.result.text)
-        lang = self._language or "auto"
-        return text, lang
-
-    def _process_vad_queue(self, base_time_ms: int) -> list[TranscriptChunk]:
-        results: list[TranscriptChunk] = []
-        while not self.vad.empty():
-            speech = self.vad.front
-            speech_samples = np.array(speech.samples, dtype=np.float32)
-            self.vad.pop()
-
-            if len(speech_samples) < MIN_SPEECH_SAMPLES:
-                continue
-
-            text, lang = self._recognize(speech_samples)
-            if not text or len(text.replace(" ", "")) < 2:
-                continue
-
-            self._segment_counter += 1
-            duration_ms = int(len(speech_samples) / SAMPLE_RATE * 1000)
-            results.append(TranscriptChunk(
-                mode=_emit_context["mode"],
-                session_id=_emit_context["sessionId"],
-                segment_id=f"seg-{self._segment_counter}",
-                source_text=text,
-                started_at_ms=base_time_ms,
-                ended_at_ms=base_time_ms + duration_ms,
-                confidence=0.0,
-                detected_lang=lang,
-            ))
-        return results
-
-    def feed_audio(self, samples: np.ndarray, base_time_ms: int) -> list[TranscriptChunk]:
-        if samples.size == 0:
-            return []
-
-        self._vad_buf = np.concatenate([self._vad_buf, samples.reshape(-1)])
-
-        while len(self._vad_buf) >= self.vad_window:
-            chunk = self._vad_buf[:self.vad_window]
-            self._vad_buf = self._vad_buf[self.vad_window:]
-            self.vad.accept_waveform(chunk)
-
-        return self._process_vad_queue(base_time_ms)
-
-    def flush(self, base_time_ms: int) -> list[TranscriptChunk]:
-        if self._vad_buf.size > 0:
-            padded = np.pad(self._vad_buf, (0, max(0, self.vad_window - self._vad_buf.size % self.vad_window) % self.vad_window))
-            while padded.size > 0:
-                chunk = padded[:self.vad_window]
-                padded = padded[self.vad_window:]
-                self.vad.accept_waveform(chunk)
-            self._vad_buf = np.zeros(0, dtype=np.float32)
-        silence_windows = int(math.ceil(0.35 * SAMPLE_RATE / self.vad_window))
-        for _ in range(max(1, silence_windows)):
-            self.vad.accept_waveform(np.zeros(self.vad_window, dtype=np.float32))
-        return self._process_vad_queue(base_time_ms)
-
-    def transcribe_buffer(self, audio: np.ndarray, base_time_ms: int) -> list[TranscriptChunk]:
-        if audio.size < MIN_SPEECH_SAMPLES:
-            return []
-        text, lang = self._recognize(audio.astype(np.float32))
-        if not text or len(text.replace(" ", "")) < 2:
-            return []
-        self._segment_counter += 1
-        duration_ms = int(audio.size / SAMPLE_RATE * 1000)
-        return [TranscriptChunk(
-            mode=_emit_context["mode"],
-            session_id=_emit_context["sessionId"],
-            segment_id=f"seg-{self._segment_counter}",
-            source_text=text,
-            started_at_ms=base_time_ms,
-            ended_at_ms=base_time_ms + duration_ms,
-            confidence=0.0,
-            detected_lang=lang,
-        )]
-
-
-class ZipformerKoreanTranscriber:
-    """VAD + Zipformer transducer optimized for Korean."""
-
-    def __init__(self) -> None:
-        self.recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
-            encoder=os.path.join(ZIPFORMER_KOREAN_MODEL_DIR, "encoder-epoch-99-avg-1.int8.onnx"),
-            decoder=os.path.join(ZIPFORMER_KOREAN_MODEL_DIR, "decoder-epoch-99-avg-1.onnx"),
-            joiner=os.path.join(ZIPFORMER_KOREAN_MODEL_DIR, "joiner-epoch-99-avg-1.int8.onnx"),
-            tokens=os.path.join(ZIPFORMER_KOREAN_MODEL_DIR, "tokens.txt"),
-            num_threads=2,
-            debug=False,
-        )
-        vad_config = sherpa_onnx.VadModelConfig()
-        vad_config.silero_vad.model = SILERO_VAD_MODEL
-        vad_config.silero_vad.min_silence_duration = 0.3
-        vad_config.silero_vad.min_speech_duration = 0.1
-        vad_config.silero_vad.max_speech_duration = MAX_SPEECH_SECONDS
-        vad_config.silero_vad.threshold = 0.25
-        vad_config.sample_rate = SAMPLE_RATE
-        self.vad = sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=60)
-        self.vad_window = 512
-        self._vad_buf = np.array([], dtype=np.float32)
-        self.finalized_ids: set[str] = set()
-        self._segment_counter = 0
-
-    def _recognize(self, audio: np.ndarray) -> tuple[str, str]:
-        stream = self.recognizer.create_stream()
-        stream.accept_waveform(SAMPLE_RATE, audio)
-        self.recognizer.decode_stream(stream)
-        text = normalize_text(stream.result.text)
-        return text, "ko"
-
-    def _process_vad_queue(self, base_time_ms: int) -> list[TranscriptChunk]:
-        results: list[TranscriptChunk] = []
-        while not self.vad.empty():
-            speech = self.vad.front
-            speech_samples = np.array(speech.samples, dtype=np.float32)
-            self.vad.pop()
-
-            if len(speech_samples) < MIN_SPEECH_SAMPLES:
-                continue
-
-            text, lang = self._recognize(speech_samples)
-            if not text or len(text.replace(" ", "")) < 2:
-                continue
-
-            self._segment_counter += 1
-            duration_ms = int(len(speech_samples) / SAMPLE_RATE * 1000)
-            results.append(TranscriptChunk(
-                mode=_emit_context["mode"],
-                session_id=_emit_context["sessionId"],
-                segment_id=f"seg-{self._segment_counter}",
-                source_text=text,
-                started_at_ms=base_time_ms,
-                ended_at_ms=base_time_ms + duration_ms,
-                confidence=0.0,
-                detected_lang=lang,
-            ))
-        return results
-
-    def feed_audio(self, samples: np.ndarray, base_time_ms: int) -> list[TranscriptChunk]:
-        if samples.size == 0:
-            return []
-
-        self._vad_buf = np.concatenate([self._vad_buf, samples.reshape(-1)])
-
-        while len(self._vad_buf) >= self.vad_window:
-            chunk = self._vad_buf[:self.vad_window]
-            self._vad_buf = self._vad_buf[self.vad_window:]
-            self.vad.accept_waveform(chunk)
-
-        return self._process_vad_queue(base_time_ms)
-
-    def flush(self, base_time_ms: int) -> list[TranscriptChunk]:
-        if self._vad_buf.size > 0:
-            padded = np.pad(self._vad_buf, (0, max(0, self.vad_window - self._vad_buf.size % self.vad_window) % self.vad_window))
-            while padded.size > 0:
-                chunk = padded[:self.vad_window]
-                padded = padded[self.vad_window:]
-                self.vad.accept_waveform(chunk)
-            self._vad_buf = np.zeros(0, dtype=np.float32)
-        silence_windows = int(math.ceil(0.35 * SAMPLE_RATE / self.vad_window))
-        for _ in range(max(1, silence_windows)):
-            self.vad.accept_waveform(np.zeros(self.vad_window, dtype=np.float32))
-        return self._process_vad_queue(base_time_ms)
-
-    def transcribe_buffer(self, audio: np.ndarray, base_time_ms: int) -> list[TranscriptChunk]:
-        if audio.size < MIN_SPEECH_SAMPLES:
-            return []
-        text, lang = self._recognize(audio.astype(np.float32))
-        if not text or len(text.replace(" ", "")) < 2:
-            return []
-        self._segment_counter += 1
-        duration_ms = int(audio.size / SAMPLE_RATE * 1000)
-        return [TranscriptChunk(
-            mode=_emit_context["mode"],
-            session_id=_emit_context["sessionId"],
-            segment_id=f"seg-{self._segment_counter}",
-            source_text=text,
-            started_at_ms=base_time_ms,
-            ended_at_ms=base_time_ms + duration_ms,
-            confidence=0.0,
-            detected_lang=lang,
-        )]
-
 
 class AppleSttTranscriber:
     """Apple SFSpeechRecognizer via compiled Swift binary.
@@ -3484,13 +3431,16 @@ class AppleSttTranscriber:
     # Number of recent promoted texts to keep for deduplication.
     DEDUP_HISTORY = 10
 
-    def __init__(self, source_lang: str = "en", partial_stable_ms: int = 600) -> None:
+    def __init__(self, source_lang: str = "en", partial_stable_ms: int = 600, contextual_strings: list[str] | None = None) -> None:
         self.partial_stable_ms = partial_stable_ms
+        # Dictation vocabulary handed to SFSpeechRecognizer as contextualStrings (bias hints, never commands).
+        self.contextual_strings = [term for term in (contextual_strings or []) if term]
         self.locale = self.LOCALE_MAP.get(source_lang, source_lang)
         self.detected_lang = source_lang if source_lang != "auto" else "en"
         self.finalized_ids: set[str] = set()
         self._segment_counter = 0
         self._proc: subprocess.Popen | None = None
+        self._stderr_thread: threading.Thread | None = None
         self._results: queue.Queue[dict[str, Any]] = queue.Queue()
         self._reader_thread: threading.Thread | None = None
         self._last_partial_text = ""
@@ -3710,28 +3660,32 @@ class AppleSttTranscriber:
                 f"Apple STT binary not found at {APPLE_STT_BIN}. "
                 "Run: bash scripts/build-apple-stt.sh"
             )
-        self._proc = subprocess.Popen(
-            [APPLE_STT_BIN, "--locale", self.locale],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-        )
+        helper_args = ["--locale", self.locale]
+        if self.contextual_strings:
+            helper_args += ["--contextual-strings-json", json.dumps(self.contextual_strings, ensure_ascii=False)]
+        self._proc = launch_apple_helper(APPLE_STT_BIN, helper_args)
         self._reader_thread = threading.Thread(target=self._read_stdout, daemon=True)
         self._reader_thread.start()
-        stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
-        stderr_thread.start()
+        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stderr_thread.start()
         # Wait for "ready" event (up to 5 seconds)
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             try:
                 event = self._results.get(timeout=0.1)
                 if event.get("type") == "ready":
-                    break
-                # Put non-ready events back
-                self._results.put(event)
+                    return
+                if event.get("type") == "error":
+                    self.stop()
+                    raise RuntimeError(event.get("message", "Apple 語音辨識啟動失敗。"))
             except queue.Empty:
-                continue
+                pass
+            if self._proc is not None and self._proc.poll() is not None:
+                code = self._proc.poll()
+                self.stop()
+                raise RuntimeError(f"Apple 語音辨識程序在就緒前結束（{code}）。請檢查語音辨識授權。")
+        self.stop()
+        raise RuntimeError("Apple 語音辨識啟動逾時，尚未開始辨識。請檢查語音辨識授權。")
 
     def stop(self) -> None:
         proc = self._proc
@@ -3751,6 +3705,12 @@ class AppleSttTranscriber:
                     proc.wait(timeout=1.5)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+                    proc.wait()
+        if proc is not None and hasattr(proc, "cleanup"):
+            for reader in (self._reader_thread, self._stderr_thread):
+                if reader is not None and reader is not threading.current_thread():
+                    reader.join(timeout=0.3)
+            proc.cleanup()
 
     def flush(self, base_time_ms: int) -> list[TranscriptChunk]:
         return self.feed_audio(np.zeros(0, dtype=np.float32), base_time_ms)
@@ -3967,17 +3927,18 @@ class SidecarApp:
         self.stop_event = threading.Event()
         self.config: SessionConfig | None = None
         self.capture: AudioCapture | None = None
-        self.transcriber: SenseVoiceTranscriber | MoonshineTranscriber | WhisperTinyEnTranscriber | WhisperSmallTranscriber | ZipformerKoreanTranscriber | AppleSttTranscriber | None = None
+        self.transcriber: SenseVoiceTranscriber     | AppleSttTranscriber | None = None
         self.translator: TranslationProvider | None = None
         self.opencc_s2t = OpenCC("s2t")
         self.dictation_parts: list[str | DictationFragment] = []
         self.dictation_started_at_ms = 0
+        self._dictation_final_session_id = ""
         self.dictation_last_update_ms = 0
         self.dictation_max_input_level = 0.0
         self.dictation_audio_buffer: list[np.ndarray] = []
         self.translation_queue: queue.Queue[tuple[TranscriptChunk | MeetingChunk, SessionConfig]] = queue.Queue()
-        self.meeting_mic_transcriber: SenseVoiceTranscriber | BreezeAsrMeetingTranscriber | MoonshineTranscriber | WhisperTinyEnTranscriber | WhisperSmallTranscriber | ZipformerKoreanTranscriber | AppleSttTranscriber | None = None
-        self.meeting_system_transcriber: SenseVoiceTranscriber | BreezeAsrMeetingTranscriber | MoonshineTranscriber | WhisperTinyEnTranscriber | WhisperSmallTranscriber | ZipformerKoreanTranscriber | AppleSttTranscriber | None = None
+        self.meeting_mic_transcriber: SenseVoiceTranscriber | BreezeAsrMeetingTranscriber     | AppleSttTranscriber | None = None
+        self.meeting_system_transcriber: SenseVoiceTranscriber | BreezeAsrMeetingTranscriber     | AppleSttTranscriber | None = None
         self.meeting_samples_fed = {"microphone": 0, "system": 0}
         self.meeting_turn_counter = 0
         self.meeting_last_turn_id = ""
@@ -4179,6 +4140,8 @@ class SidecarApp:
             dictation_cloud_enhancement_enabled=bool(payload.get("dictationCloudEnhancementEnabled", False)),
             dictation_output_style=str(payload.get("dictationOutputStyle", "literal")),
             dictation_initial_prompt_text=str(payload.get("dictationInitialPromptText", "")),
+            dictation_dictionary_text=str(payload.get("dictationDictionaryText", "")),
+            dictation_hotwords=str(payload.get("dictationHotwords", "")),
             dictation_vocabulary_context=str(payload.get("dictationVocabularyContext", "")),
             dictation_proper_noun_correction_enabled=bool(payload.get("dictationProperNounCorrectionEnabled", True)),
             dictation_personal_glossary=str(payload.get("dictationPersonalGlossary", "")),
@@ -4207,8 +4170,9 @@ class SidecarApp:
             self.dictation_last_update_ms = self.dictation_started_at_ms
             self.dictation_max_input_level = 0.0
             self.dictation_audio_buffer = []
-            emit(build_dictation_state_event("recording", "Dictation session started"))
-            trace_debug(f"dictation recording session={self.config.session_id}")
+            # "recording" is announced after the microphone has actually opened (below): opening a Bluetooth mic such
+            # as AirPods can take seconds, and saying "recording" earlier made the user speak into nothing.
+            trace_debug(f"dictation starting session={self.config.session_id}")
         if self.config.mode == "meeting":
             self.meeting_samples_fed = {"microphone": 0, "system": 0}
             self.meeting_turn_counter = 0
@@ -4221,7 +4185,7 @@ class SidecarApp:
             self._init_meeting_audio_writers()
         self.stop_event.clear()
         self.active = True
-        emit({"type": "session_state", "state": "connecting", "detail": f"Connecting to {self.config.device_id}"})
+        emit({"type": "session_state", "state": "connecting", "detail": "Connecting to " + ("the system default input" if self.config.device_id == SYSTEM_DEFAULT_DEVICE_ID else str(self.config.device_id))})
         trace_debug(f"output_device_id={self.config.output_device_id!r} sck_check={self.config.output_device_id == SCREENCAPTUREKIT_DEVICE_ID}")
 
         try:
@@ -4230,6 +4194,9 @@ class SidecarApp:
             self.capture = AudioCapture(self.config.device_id, self.config.chunk_ms, self.config.output_device_id,
                                         sck_pipe_path=sck_pipe, sck_sample_rate=sck_sr)
             self.capture.start()
+            if self.config.mode == "dictation":
+                emit(build_dictation_state_event("recording", "Dictation session started"))
+                trace_debug(f"dictation recording session={self.config.session_id}")
             if self.config.mode == "meeting":
                 self.transcriber = None
                 if self.config.meeting_source_mode in {"microphone", "dual"}:
@@ -4312,11 +4279,55 @@ class SidecarApp:
             "detail": "Session settings updated",
         })
 
+    def _abandon_stop_after_consumer_timeout(self) -> None:
+        """The consumer is still feeding audio after the extended join. Do not emit a result and do not release
+        the capture or transcriber under it: report the failure, finish the session state, and let a watcher
+        thread release the resources once the consumer really ends."""
+        config = self.config
+        thread = self.thread
+        trace_debug(f"stop_session consumer timeout session={config.session_id if config else 'none'}")
+        emit({"type": "error", "code": "stop_consumer_timeout", "message": "停止錄音時辨識仍在處理，這次結果已放棄。", "recoverable": True})
+        capture, transcriber = self.capture, self.transcriber
+        self.capture = None
+        self.transcriber = None
+        self.thread = None
+        self.dictation_audio_buffer = []
+        self.dictation_parts = []
+
+        def release_later() -> None:
+            if thread is not None:
+                thread.join()
+            for resource in (capture, transcriber):
+                stop = getattr(resource, "stop", None)
+                if callable(stop):
+                    try:
+                        stop()
+                    except Exception as error:
+                        trace_debug(f"deferred release failed error={error}")
+
+        threading.Thread(target=release_later, daemon=True).start()
+        if config is not None and config.mode == "dictation":
+            emit(build_dictation_state_event("stopped", "Dictation stop timed out"))
+        if self.active:
+            self.active = False
+            emit({"type": "session_state", "state": "stopped"})
+        emit({"type": "session_stopped_ack"})
+
     def stop_session(self) -> None:
         trace_debug(f"stop_session enter active={self.active} session={self.config.session_id if self.config else 'none'}")
+        stream_mode = self.config is not None and self.config.mode != "meeting"
+        if stream_mode and self.capture is not None:
+            # Stop the producer first; the consumer then drains the queued tail before it exits.
+            try:
+                self.capture.stop()
+            except Exception as error:
+                trace_debug(f"stop_session capture stop failed error={error}")
         self.stop_event.set()
         if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=1.5)
+            self.thread.join(timeout=STOP_CONSUMER_JOIN_SECONDS if stream_mode else 1.5)
+        if self.thread and self.thread.is_alive():
+            self._abandon_stop_after_consumer_timeout()
+            return
         self.thread = None
 
         if self.config is not None and self.config.mode == "meeting":
@@ -4339,6 +4350,7 @@ class SidecarApp:
                         self._emit_final_chunk(chunk)
                 except Exception as error:
                     trace_debug(f"dictation apple-stt drain failed error={error}")
+                    emit({"type": "error", "code": "dictation_flush_failed", "message": f"語音辨識收尾失敗，句尾可能不完整：{error}", "recoverable": True})
             else:
                 # Flush streaming transcriber
                 flush = getattr(self.transcriber, "flush", None)
@@ -4348,6 +4360,7 @@ class SidecarApp:
                             self._emit_final_chunk(chunk)
                     except Exception as error:
                         trace_debug(f"dictation flush failed error={error}")
+                        emit({"type": "error", "code": "dictation_flush_failed", "message": f"語音辨識收尾失敗，句尾可能不完整：{error}", "recoverable": True})
 
             # MLX Batch Fallback - Wrap in try/except to prevent breaking other models
             try:
@@ -4366,9 +4379,7 @@ class SidecarApp:
                     transcribe_buffer = getattr(self.transcriber, "transcribe_buffer", None)
                     if callable(transcribe_buffer) and buffered_audio is not None:
                         batch_detail = "Running batch transcription..."
-                        if self.config.stt_model == "whisper-mlx":
-                            batch_detail = "Running MLX Whisper batch..."
-                        elif self.config.stt_model == "breeze-asr-25":
+                        if self.config.stt_model == "breeze-asr-25":
                             batch_detail = "Running Breeze ASR 25 batch..."
                         elif self.config.stt_model == "groq-whisper":
                             batch_detail = "Running Groq Whisper cloud transcription..."
@@ -4379,11 +4390,18 @@ class SidecarApp:
             except Exception as batch_error:
                 trace_debug(f"MLX batch fallback fatal error: {batch_error}")
 
+            if self.dictation_audio_buffer:
+                maybe_save_dictation_debug_audio(
+                    self.config.session_id,
+                    np.concatenate(self.dictation_audio_buffer).astype(np.float32),
+                    " ".join(_get_dictation_fragment_text(part) for part in self.dictation_parts),
+                )
+
             # Finalize event emission
             self.dictation_last_update_ms = max(self.dictation_last_update_ms, now_ms())
             emit(build_dictation_state_event("processing", "Finalizing dictation output"))
             emit(build_dictation_state_event("stopped", "Dictation session stopped"))
-            emit(
+            final_event = (
                 build_dictation_final_event(
                     self.config.session_id,
                     self.dictation_parts,
@@ -4412,6 +4430,9 @@ class SidecarApp:
                     local_llm_prompt=self.config.dictation_local_llm_prompt,
                 )
             )
+            if self._dictation_final_session_id != self.config.session_id:
+                self._dictation_final_session_id = self.config.session_id
+                emit(final_event)
 
         # Cleanup capture and state
         if self.capture is not None:
@@ -4818,7 +4839,7 @@ class SidecarApp:
             incoming_mic = self.capture.drain_primary() if self.config.meeting_source_mode in {"microphone", "dual"} else np.zeros(0, dtype=np.float32)
             incoming_system = self.capture.drain_output() if self.config.meeting_source_mode == "dual" else np.zeros(0, dtype=np.float32)
             if self.config.meeting_source_mode == "system-audio":
-                incoming_system = self.capture.drain_primary()
+                incoming_system = self.capture.drain_output() if getattr(self.capture, '_use_sck', False) else self.capture.drain_primary()
 
             if self.config.meeting_source_mode == "dual":
                 self._append_dual_meeting_audio(incoming_mic, incoming_system)
@@ -4844,20 +4865,15 @@ class SidecarApp:
         emit({"type": "session_state", "state": "streaming"})
         assert self.capture is not None
         assert self.transcriber is not None
+        # Bound locally: stop_session may detach these from self (timeout path) while this thread is still running.
+        capture = self.capture
+        transcriber = self.transcriber
 
         session_start_ms = now_ms()
         total_samples_fed = 0
 
-        while not self.stop_event.is_set():
-            time.sleep(0.025)  # 25ms poll interval for lower latency
-            incoming = self.capture.drain()
-
-            self._emit_metrics()
-            if self.config.mode == "dictation":
-                self.dictation_max_input_level = max(self.dictation_max_input_level, self.capture.level)
-
-            if incoming.size == 0:
-                continue
+        def feed_block(incoming: np.ndarray) -> None:
+            nonlocal total_samples_fed
             if self.config.mode == "dictation":
                 self.dictation_audio_buffer.append(np.copy(incoming))
 
@@ -4867,7 +4883,7 @@ class SidecarApp:
 
             # Feed audio to VAD + STT (or pipe to Apple STT subprocess)
             started_at = now_ms()
-            chunks = self.transcriber.feed_audio(incoming, base_time_ms)
+            chunks = transcriber.feed_audio(incoming, base_time_ms)
             inference_ms = now_ms() - started_at
 
             for chunk in chunks:
@@ -4876,6 +4892,25 @@ class SidecarApp:
             if inference_ms > 0:
                 self._emit_metrics(processing_lag_ms=inference_ms, force=True)
 
+        while not self.stop_event.is_set():
+            time.sleep(0.025)  # 25ms poll interval for lower latency
+            incoming = capture.drain()
+
+            self._emit_metrics()
+            if self.config.mode == "dictation":
+                self.dictation_max_input_level = max(self.dictation_max_input_level, capture.level)
+
+            if incoming.size == 0:
+                continue
+            feed_block(incoming)
+
+        # stop_session stops the producer before setting stop_event, so whatever is still queued is the complete
+        # tail of the recording. Feed it before the thread ends so the recogniser flush sees every sample.
+        while True:
+            tail = capture.drain()
+            if tail.size == 0:
+                break
+            feed_block(tail)
 
     def _translation_loop(self) -> None:
         while True:
@@ -4954,93 +4989,11 @@ class SidecarApp:
 
 
 def _apply_model_dir(model_dir: str) -> None:
-    global MODEL_BASE_DIR, SENSEVOICE_MODEL_DIR, WHISPER_TINY_EN_MODEL_DIR
-    global WHISPER_SMALL_MODEL_DIR, ZIPFORMER_KOREAN_MODEL_DIR, SILERO_VAD_MODEL
+    global MODEL_BASE_DIR, SENSEVOICE_MODEL_DIR, SILERO_VAD_MODEL
     MODEL_BASE_DIR = model_dir
     SENSEVOICE_MODEL_DIR = os.path.join(model_dir, "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
-    WHISPER_TINY_EN_MODEL_DIR = os.path.join(model_dir, "sherpa-onnx-whisper-tiny.en")
-    WHISPER_SMALL_MODEL_DIR = os.path.join(model_dir, "sherpa-onnx-whisper-small")
-    ZIPFORMER_KOREAN_MODEL_DIR = os.path.join(model_dir, "sherpa-onnx-zipformer-korean-2024-06-24")
     SILERO_VAD_MODEL = os.path.join(model_dir, "silero_vad.onnx")
 
-
-def run_mlx_whisper_probe() -> int:
-    # --- CRITICAL: Path Injection for Frozen Binary ---
-    if getattr(sys, 'frozen', False):
-        internal_path = os.path.join(sys._MEIPASS, "_internal")
-        if internal_path not in sys.path:
-            sys.path.insert(0, internal_path)
-    # --------------------------------------------------
-
-    try:
-        import mlx.core as mx  # type: ignore
-        mx.random.key(0)
-        sys.stdout.write("READY\n")
-        sys.stdout.flush()
-        return 0
-    except Exception as e:
-        sys.stderr.write(f"PROBE_FAILED: {str(e)}\n")
-        return 1
-
-
-def run_mlx_whisper_transcribe(audio_path: str, source_lang: str | None, initial_prompt: str = "") -> int:
-    import re
-    import time
-    import traceback
-    import json
-    
-    # --- CRITICAL: Diagnostic Logging ---
-    def log_diag(msg):
-        try:
-            with open("/tmp/mlx_sidecar_debug.log", "a") as f:
-                f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
-        except:
-            pass
-    
-    log_diag(f"Worker started. Audio: {audio_path}")
-
-    if getattr(sys, 'frozen', False):
-        # In PyInstaller, _internal is sibling to the executable or in _MEIPASS
-        internal_path = os.path.join(sys._MEIPASS, "_internal")
-        if internal_path not in sys.path:
-            sys.path.insert(0, internal_path)
-            log_diag(f"Injected sys.path: {internal_path}")
-
-    try:
-        import mlx_whisper # type: ignore
-        import mlx.core as mx # type: ignore
-        log_diag(f"MLX Loaded. Version: {getattr(mx, '__version__', 'unknown')}")
-        
-        normalized_source = normalize_mlx_whisper_lang(source_lang or "auto")
-        kwargs: dict[str, Any] = {}
-        if normalized_source:
-            kwargs["language"] = normalized_source
-        normalized_prompt = normalize_text(initial_prompt)
-        if normalized_prompt:
-            kwargs["initial_prompt"] = normalized_prompt
-
-        # Perform transcription
-        result = mlx_whisper.transcribe(audio_path, path_or_hf_repo=MLX_WHISPER_MODEL, **kwargs)
-        text = str(result.get("text", ""))
-        log_diag(f"Transcription success. Text: {text[:50]}...")
-
-        output_obj = {
-            "text": text,
-            "language": str(result.get("language", normalized_source or "")),
-        }
-        
-        # Write to stdout with explicit markers to help the parent find it
-        sys.stdout.write("\nMLX_JSON_START\n")
-        sys.stdout.write(json.dumps(output_obj, ensure_ascii=False))
-        sys.stdout.write("\nMLX_JSON_END\n")
-        sys.stdout.flush()
-        return 0
-
-    except Exception as e:
-        err_msg = f"ERROR: {str(e)}\n{traceback.format_exc()}"
-        log_diag(err_msg)
-        sys.stderr.write(err_msg)
-        return 1
 
 
 def run_breeze_asr_download() -> int:
@@ -5117,31 +5070,12 @@ def cli() -> int:
         sys.stderr.write("ERROR: --run-script requires a script path\n")
         return 1
 
-    if "--mlx-whisper-probe" in sys.argv:
-        return run_mlx_whisper_probe()
-
     if "--breeze-asr-download" in sys.argv:
         return run_breeze_asr_download()
 
     if "--breeze-asr-probe" in sys.argv:
         return run_breeze_asr_probe()
     
-    if "--mlx-whisper-transcribe" in sys.argv:
-        audio_path = ""
-        source_lang = ""
-        initial_prompt = ""
-        for i, arg in enumerate(sys.argv):
-            if arg == "--audio-path" and i + 1 < len(sys.argv):
-                audio_path = sys.argv[i + 1]
-            if arg == "--source-lang" and i + 1 < len(sys.argv):
-                source_lang = sys.argv[i + 1]
-            if arg == "--initial-prompt" and i + 1 < len(sys.argv):
-                initial_prompt = sys.argv[i + 1]
-        if not audio_path:
-            sys.stderr.write("ERROR: --audio-path missing in MLX hot-path\n")
-            return 1
-        return run_mlx_whisper_transcribe(audio_path, source_lang, initial_prompt)
-
     if "--breeze-asr-transcribe" in sys.argv:
         audio_path = ""
         source_lang = ""
@@ -5162,11 +5096,11 @@ def cli() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--list-devices", action="store_true")
     parser.add_argument("--enroll-speaker", action="store_true")
-    parser.add_argument("--mlx-whisper-probe", action="store_true")
-    parser.add_argument("--mlx-whisper-transcribe", action="store_true")
     parser.add_argument("--breeze-asr-download", action="store_true")
     parser.add_argument("--breeze-asr-probe", action="store_true")
     parser.add_argument("--breeze-asr-transcribe", action="store_true")
+    parser.add_argument("--transcribe-probe", action="store_true")
+    parser.add_argument("--transcribe-model", type=str, default="")
     parser.add_argument("--audio-path", type=str, default="")
     parser.add_argument("--source-lang", type=str, default="")
     parser.add_argument("--initial-prompt", type=str, default="")
@@ -5182,6 +5116,11 @@ def cli() -> int:
         sys.stdout.write(json.dumps(list_audio_devices(), ensure_ascii=False) + "\n")
         return 0
 
+    if args.transcribe_probe:
+        result = run_transcribe_probe(args.transcribe_model, args.audio_path)
+        sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+        return 0 if result.get("ok") else 1
+
     if args.enroll_speaker:
         if not args.device_id:
             raise RuntimeError("--device-id is required for --enroll-speaker")
@@ -5193,4 +5132,5 @@ def cli() -> int:
 
 
 if __name__ == "__main__":
+    start_sensevoice_idle_watchdog()
     raise SystemExit(cli())

@@ -1,5 +1,6 @@
 import { shouldRenderSubtitleOverlay, getSubtitlePreview, type OverlayMode } from './overlay-preview.js';
 import { createSettingsSaveQueue, type SettingsSaveQueue, type SettingsSaveStatus } from './settings-save-queue.js';
+import { buildDictationVocabularyFields } from '../electron/dictation-session-fields.js';
 import { SetupPanel } from './SetupPanel.js';
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
@@ -15,8 +16,9 @@ import type {
   SidecarEvent,
 } from '../electron/types.js';
 import { applySettingsOverlayStyle, initialViewState, reduceSidecarEvent } from './caption-state.js';
-import { initialDictationViewState, reduceDictationEvent, reduceDictationOutputStatus } from './dictation-state.js';
-import { pickPreferredInputDevice } from './device-preferences.js';
+import { defaultDurationsForEngine, learnStageDuration, progressFraction, stageIsRunningLong, type StageDurations, type TimedStage } from './dictation-progress-model.js';
+import { getDictationProgress, initialDictationViewState, reduceDictationEvent, reduceDictationOutputStatus, reduceDictationStarting } from './dictation-state.js';
+import { pickPreferredInputDevice, resolveDictationDeviceId, SYSTEM_DEFAULT_DEVICE_ID } from './device-preferences.js';
 import { getDictationHotkeyLabel, isModifierOnlyHotkey, validateDictationHotkey } from './dictation-hotkey.js';
 import { initialMeetingViewState, reduceMeetingEvent } from './meeting-state.js';
 import { buildMeetingTurns } from './meeting-turns.js';
@@ -30,13 +32,91 @@ import {
 
 const GROQ_MODEL_OPTIONS = [
   { value: 'auto', label: '自動選擇（推薦）' },
-  { value: 'llama-3.3-70b-versatile', label: 'Llama 3.3 70B Versatile' },
-  { value: 'qwen/qwen3-32b', label: 'Qwen 3 32B' },
+  { value: 'openai/gpt-oss-120b', label: 'GPT-OSS 120B' },
   { value: 'custom', label: '自訂模型' },
 ] as const;
 
 function isOverlayRoute() {
   return window.location.hash === '#overlay';
+}
+
+const stageDurationStorageKey = (engine: string) => `bicaption.dictationStageMs.v2.${engine}`;
+
+function loadStageDurations(engine: string): StageDurations {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(stageDurationStorageKey(engine)) ?? 'null');
+    if (parsed && ['transcribing', 'transcribingPerSecond', 'polishing', 'outputting'].every((key) => Number.isFinite(parsed[key]) && parsed[key] >= 0)) {
+      return parsed as StageDurations;
+    }
+  } catch {
+    // storage can be unavailable or hold junk; fall back to the measured defaults
+  }
+  return defaultDurationsForEngine(engine);
+}
+
+function saveStageDurations(engine: string, durations: StageDurations) {
+  try {
+    window.localStorage.setItem(stageDurationStorageKey(engine), JSON.stringify(durations));
+  } catch {
+    // best effort
+  }
+}
+
+/**
+ * Bar position for the work after the key is released. The stage comes from real events; within it the bar advances
+ * against how long that stage has really taken here for this engine (recognition scaled by how long you spoke), and it
+ * only reaches 100% when the output is actually done.
+ */
+function useDictationBar(stageName: string | undefined, polishEnabled: boolean, engine: string): { fraction: number | null; runningLong: boolean } {
+  const [state, setState] = useState<{ fraction: number | null; runningLong: boolean }>({ fraction: null, runningLong: false });
+  const durationsRef = useRef<StageDurations>(defaultDurationsForEngine(engine));
+  const loadedEngineRef = useRef<string | null>(null);
+  const currentRef = useRef<{ stage: TimedStage | null; startedAt: number }>({ stage: null, startedAt: 0 });
+  const listeningStartedRef = useRef<number | null>(null);
+  const recordedMsRef = useRef(0);
+  const timedStage: TimedStage | null = stageName === 'transcribing' || stageName === 'polishing' || stageName === 'outputting' ? stageName : null;
+  const finished = stageName === 'finished';
+
+  useEffect(() => {
+    if (loadedEngineRef.current !== engine) {
+      durationsRef.current = loadStageDurations(engine);
+      loadedEngineRef.current = engine;
+    }
+    const now = Date.now();
+    if (stageName === 'listening' && listeningStartedRef.current === null) {
+      listeningStartedRef.current = now;
+    } else if (stageName !== 'listening' && !timedStage) {
+      listeningStartedRef.current = null; // a cancelled or finished take must not lengthen the next one
+    }
+    if (timedStage === 'transcribing' && listeningStartedRef.current !== null) {
+      recordedMsRef.current = now - listeningStartedRef.current;
+      listeningStartedRef.current = null;
+    }
+    const previous = currentRef.current;
+    if (previous.stage && previous.stage !== timedStage && (timedStage !== null || finished)) {
+      durationsRef.current = learnStageDuration(durationsRef.current, previous.stage, now - previous.startedAt, recordedMsRef.current);
+      saveStageDurations(engine, durationsRef.current);
+    }
+    if (previous.stage !== timedStage) {
+      currentRef.current = { stage: timedStage, startedAt: now };
+    }
+    if (!timedStage) {
+      setState({ fraction: finished ? 1 : null, runningLong: false });
+      return undefined;
+    }
+    const tick = () => {
+      const elapsedMs = Date.now() - currentRef.current.startedAt;
+      setState({
+        fraction: progressFraction({ stage: timedStage, elapsedMs, recordedMs: recordedMsRef.current, polishEnabled, durations: durationsRef.current }),
+        runningLong: stageIsRunningLong(timedStage, elapsedMs, durationsRef.current, recordedMsRef.current),
+      });
+    };
+    tick();
+    const timer = window.setInterval(tick, 50);
+    return () => window.clearInterval(timer);
+  }, [stageName, timedStage, finished, polishEnabled, engine]);
+
+  return state;
 }
 
 function OverlayView({
@@ -52,12 +132,7 @@ function OverlayView({
 }) {
   const overlayStyle = applySettingsOverlayStyle(settings);
   const hasVisibleCaptions = viewState.captions.length > 0 || Boolean(viewState.partial);
-  const isDictationActive = ['connecting', 'streaming'].includes(dictationState.sessionState)
-    || ['recording', 'capturing', 'processing'].includes(dictationState.dictationState);
-  const [showDictationResult, setShowDictationResult] = useState(false);
-  const shouldShowDictationPrompt = isDictationActive || showDictationResult;
   const shouldShowShell = shouldRenderSubtitleOverlay(overlayMode, viewState.sessionState, hasVisibleCaptions)
-    || shouldShowDictationPrompt
     || overlayMode === 'dictation';
   const translationEnabled = isTranslationEnabled(settings);
   const stackRef = useRef<HTMLElement | null>(null);
@@ -65,15 +140,20 @@ function OverlayView({
   const [isFollowingLatest, setIsFollowingLatest] = useState(true);
   const dragRef = useRef<{ startX: number; startY: number; winX: number; winY: number } | null>(null);
   const suppressOrbClickRef = useRef(false);
-  const dictationPrompt = getDictationPrompt(dictationState, showDictationResult);
-  const effectiveDictationPrompt = overlayMode === 'dictation'
-    ? dictationPrompt ?? {
-      tone: 'live' as const,
-      title: '正在聽你說',
-      detail: '按住快捷鍵說話，放開後送出辨識。',
-    }
-    : dictationPrompt;
   const isDictationOverlayMode = overlayMode === 'dictation';
+  const progressOptions = { polishEnabled: settings.dictationAppleIntelligenceEnabled };
+  // The dictation overlay only exists while a dictation is starting or running, so an empty state means "preparing".
+  const waitingForMicrophone = dictationState.dictationState === 'preparing'
+    || (dictationState.dictationState === 'idle' && ['connecting', 'streaming'].includes(dictationState.sessionState));
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!waitingForMicrophone) return undefined;
+    const timer = window.setInterval(() => setNowMs(Date.now()), 100);
+    return () => window.clearInterval(timer);
+  }, [waitingForMicrophone]);
+  const dictationProgress = getDictationProgress(dictationState, { ...progressOptions, nowMs })
+    ?? (overlayMode === 'dictation' ? getDictationProgress(reduceDictationStarting(), progressOptions) : null);
+  const { fraction: barFraction, runningLong } = useDictationBar(dictationProgress?.stage, settings.dictationAppleIntelligenceEnabled, settings.dictationSttModel);
   const isPreview = overlayMode === 'preview';
   const preview = getSubtitlePreview(settings.sourceLang, settings.targetLang);
 
@@ -126,15 +206,6 @@ function OverlayView({
   }, [isFollowingLatest, viewState.captions, viewState.partial]);
 
   useEffect(() => {
-    if (!dictationState.finalText) {
-      return;
-    }
-    setShowDictationResult(true);
-    const timeoutId = window.setTimeout(() => setShowDictationResult(false), 1800);
-    return () => window.clearTimeout(timeoutId);
-  }, [dictationState.finalText]);
-
-  useEffect(() => {
     function onMouseMove(e: MouseEvent) {
       const drag = dragRef.current;
       if (!drag) return;
@@ -175,11 +246,12 @@ function OverlayView({
     setIsFollowingLatest(true);
   }
 
-  if (isDictationOverlayMode && effectiveDictationPrompt) {
+  if (isDictationOverlayMode) {
+    const orbTone = dictationProgress?.tone ?? 'live';
     return (
       <main className="overlay-window overlay-window-dictation" style={overlayStyle}>
         <section
-          className={`dictation-float-shell dictation-float-shell-${effectiveDictationPrompt.tone}`}
+          className={`dictation-float-shell dictation-float-shell-${orbTone}${dictationProgress ? ' dictation-float-shell-with-progress' : ''}`}
           onMouseDown={async (e) => {
             if (!(e.target as HTMLElement).closest('.dictation-float-orb')) {
               return;
@@ -190,7 +262,7 @@ function OverlayView({
           }}
         >
           <button
-            className={`dictation-float-orb dictation-float-${effectiveDictationPrompt.tone}`}
+            className={`dictation-float-orb dictation-float-${orbTone}`}
             onClick={(e) => {
               if (suppressOrbClickRef.current) {
                 suppressOrbClickRef.current = false;
@@ -200,9 +272,9 @@ function OverlayView({
               }
               void closeOverlayAndFocusSettings();
             }}
-            aria-label={effectiveDictationPrompt.title}
+            aria-label={dictationProgress?.title ?? '語音輸入'}
           >
-            {effectiveDictationPrompt.tone === 'live' ? (
+            {orbTone === 'live' ? (
               <>
                 <span className="dictation-float-wave dictation-float-wave-a" />
                 <span className="dictation-float-wave dictation-float-wave-b" />
@@ -214,7 +286,7 @@ function OverlayView({
                 </span>
               </>
             ) : null}
-            {effectiveDictationPrompt.tone === 'processing' ? (
+            {orbTone === 'processing' ? (
               <span className="dictation-float-processing-glyph" aria-hidden="true">
                 <span className="dictation-float-spinner" />
                 <span className="dictation-float-dot dictation-float-dot-a" />
@@ -222,12 +294,62 @@ function OverlayView({
                 <span className="dictation-float-dot dictation-float-dot-c" />
               </span>
             ) : null}
-            {effectiveDictationPrompt.tone === 'done' ? (
+            {orbTone === 'done' ? (
               <span className="dictation-float-done-glyph" aria-hidden="true">
                 <span className="dictation-float-check" />
               </span>
             ) : null}
+            {orbTone === 'warning' || orbTone === 'error' ? (
+              <span className="dictation-float-alert-glyph" aria-hidden="true">!</span>
+            ) : null}
           </button>
+          {dictationProgress ? (
+            <div className="dictation-float-progress" role="status" aria-live="polite">
+              <span className="dictation-float-title">{dictationProgress.title}</span>
+              {runningLong && barFraction !== null && dictationProgress.tone === 'processing'
+                ? <span className="dictation-float-detail">比平常久一點，還在處理…</span>
+                : dictationProgress.detail ? <span className="dictation-float-detail">{dictationProgress.detail}</span> : null}
+              {barFraction !== null && dictationProgress.stage !== 'listening' ? (
+                <span
+                  className={`dictation-float-bar dictation-float-bar-${dictationProgress.tone}`}
+                  role="progressbar"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={Math.round(barFraction * 100)}
+                >
+                  <span className="dictation-float-bar-fill" style={{ width: `${Math.round(barFraction * 100)}%` }} />
+                </span>
+              ) : dictationProgress.steps.length > 0 ? (
+                <span className="dictation-float-steps" aria-hidden="true">
+                  {dictationProgress.steps.map(step => (
+                    <span key={step.key} className={`dictation-float-step dictation-float-step-${step.status}`} title={step.label} />
+                  ))}
+                </span>
+              ) : null}
+            </div>
+          ) : null}
+          {dictationProgress?.cancellable ? (
+            <div className="dictation-float-actions">
+              <button
+                type="button"
+                className="dictation-float-action dictation-float-action-cancel"
+                aria-label="取消這次語音輸入"
+                title="取消"
+                onClick={() => { void window.app.cancelDictation(); }}
+              >
+                ✕
+              </button>
+              <button
+                type="button"
+                className="dictation-float-action dictation-float-action-confirm"
+                aria-label="結束收音並送出"
+                title="完成"
+                onClick={() => { void window.app.confirmDictation(); }}
+              >
+                ✓
+              </button>
+            </div>
+          ) : null}
         </section>
       </main>
     );
@@ -255,27 +377,6 @@ function OverlayView({
         )}
       </header>
       <section className={`overlay-body${isDictationOverlayMode ? ' overlay-body-prompt-only' : ''}`} ref={stackRef}>
-          {shouldShowDictationPrompt && dictationPrompt && (
-            <div className={`dictation-prompt dictation-prompt-${dictationPrompt.tone} no-drag`}>
-              <span className="dictation-prompt-dot" aria-hidden="true">
-                {dictationPrompt.tone === 'live' && (
-                  <>
-                    <span className="dictation-prompt-ring dictation-prompt-ring-a" />
-                    <span className="dictation-prompt-ring dictation-prompt-ring-b" />
-                  </>
-                )}
-              </span>
-              <div className="dictation-prompt-copy">
-                <p className="dictation-prompt-title">{dictationPrompt.title}</p>
-                <p className="dictation-prompt-text">{dictationPrompt.detail}</p>
-                {dictationPrompt.tone === 'processing' && (
-                  <span className="dictation-prompt-progress" aria-hidden="true">
-                    <span className="dictation-prompt-progress-bar" />
-                  </span>
-                )}
-              </div>
-            </div>
-          )}
           {!isDictationOverlayMode && !isPreview ? viewState.captions.map((caption) => (
             <div key={caption.segmentId} className="caption-pair no-drag">
               <p className="caption-line">{caption.sourceText}</p>
@@ -343,12 +444,16 @@ function useDictationState() {
       return;
     }
 
-    return window.app.subscribe('sidecar:event', (payload) => {
+    const unsubscribeEvents = window.app.subscribe('sidecar:event', (payload) => {
       const event = payload as SidecarEvent;
       startTransition(() => {
         setViewState((current) => reduceDictationEvent(current, event));
       });
     });
+    const unsubscribeStarting = window.app.subscribe('dictation:starting', () => {
+      setViewState(reduceDictationStarting());
+    });
+    return () => { unsubscribeEvents(); unsubscribeStarting(); };
   }, []);
 
   useEffect(() => {
@@ -420,48 +525,6 @@ function useMeetingState() {
   return { ...viewState, clearEntries };
 }
 
-function getDictationPrompt(
-  state: ReturnType<typeof useDictationState>,
-  showResult: boolean,
-): { tone: 'live' | 'processing' | 'done'; title: string; detail: string } | null {
-  if (state.lastError) {
-    return {
-      tone: 'processing',
-      title: '語音輸入中斷',
-      detail: state.lastError,
-    };
-  }
-  if (state.dictationState === 'recording') {
-    return {
-      tone: 'live',
-      title: '正在聽你說',
-      detail: '按住快捷鍵繼續說話，放開後送出辨識。',
-    };
-  }
-  if (state.dictationState === 'capturing' || (state.activeSessionId && state.sessionState === 'connecting' && state.dictationState !== 'stopped')) {
-    return {
-      tone: 'live',
-      title: '正在聽你說',
-      detail: '持續收音中，放開後才會開始整理。',
-    };
-  }
-  if (state.dictationState === 'processing' || state.dictationState === 'stopped' || (state.activeSessionId && state.sessionState === 'stopped' && !state.finalText)) {
-    return {
-      tone: 'processing',
-      title: '正在整理語音',
-      detail: '放開後會自動完成辨識並輸出文字。',
-    };
-  }
-  if (state.finalText) {
-    return {
-      tone: 'done',
-      title: '已完成語音輸入',
-      detail: state.finalText,
-    };
-  }
-  return null;
-}
-
 function isMeetingTranslationEnabled(settings: AppSettings): boolean {
   return settings.meetingTranslateModel !== 'disabled';
 }
@@ -491,10 +554,10 @@ function buildSessionConfig(settings: AppSettings, mode: SessionMode = 'subtitle
     bestOf: settings.bestOf,
     vadFilter: settings.vadFilter,
     conditionOnPrev: settings.conditionOnPrev,
-    dictationRewriteMode: isDictation ? settings.dictationRewriteMode : undefined,
+    dictationRewriteMode: isDictation ? (settings.dictationAppleIntelligenceEnabled ? 'rules' : settings.dictationRewriteMode) : undefined,
     dictationCloudEnhancementEnabled: isDictation ? settings.dictationCloudEnhancementEnabled : undefined,
     dictationOutputStyle: isDictation ? settings.dictationOutputStyle : undefined,
-    dictationInitialPromptText: isDictation ? settings.dictationInitialPromptText : undefined,
+    ...buildDictationVocabularyFields(settings, mode),
     dictationVocabularyContext: undefined,
     dictationProperNounCorrectionEnabled: isDictation ? false : undefined,
     dictationPersonalGlossary: undefined,
@@ -581,6 +644,20 @@ const MODEL_LIBRARY = [
     description: '台灣中文與中英混說的本地精準辨識；聽寫放鍵或會議偵測到停頓後才產生完整文字。',
   },
   {
+    key: 'qwen3-asr',
+    label: 'Qwen3-ASR 0.6B',
+    sizeLabel: '~0.6 GB',
+    format: 'GGUF (Q4) / transcribe.cpp',
+    description: '實驗：準確度最高的本地聽寫引擎，會吃個人詞庫；使用中約佔 1 GB 記憶體，閒置 3 分鐘後釋放。僅聽寫可用。',
+  },
+  {
+    key: 'breeze-gguf',
+    label: 'Breeze ASR 25 輕量版',
+    sizeLabel: '~1.0 GB',
+    format: 'GGUF (Q4) / transcribe.cpp',
+    description: '台灣中文與中英混說調校的本地聽寫引擎，測試中最準；記憶體約 1.4 GB，閒置 3 分鐘後釋放；放開後約 1 秒出字，輸出無標點。僅聽寫可用。',
+  },
+  {
     key: 'vad',
     label: 'Silero VAD',
     sizeLabel: '~2 MB',
@@ -592,9 +669,14 @@ const MODEL_LIBRARY = [
 const ASR_MODEL_OPTIONS = [
   { key: 'groq-whisper', label: 'Groq Whisper', note: '線上高準確 / 需網路' },
   { key: 'breeze-asr-25', label: 'Breeze ASR 25 精準辨識', note: '本地分段 / 台灣中文與混語' },
+  { key: 'breeze-gguf', label: 'Breeze 台灣中文輕量版（實驗）', note: '本地 / 約 1.4 GB 記憶體 / 台灣中文' },
+  { key: 'qwen3-asr', label: 'Qwen3-ASR 高準確度（實驗）', note: '本地 / 約 1 GB 記憶體 / 吃個人詞庫' },
   { key: 'apple-stt', label: 'SFSpeechRecognizer', note: '本地快速' },
   { key: 'sensevoice', label: 'SenseVoice', note: '本地多語' },
 ] as const;
+
+const MEETING_ASR_MODEL_OPTIONS = ASR_MODEL_OPTIONS.filter((option) =>
+  option.key === 'breeze-asr-25' || option.key === 'sensevoice');
 
 const SUBTITLE_ASR_MODEL_OPTIONS = ASR_MODEL_OPTIONS.filter((option) =>
   option.key === 'apple-stt' || option.key === 'sensevoice');
@@ -675,6 +757,7 @@ function AppGlyph({ name, size = 16 }: { name: AppGlyphName; size?: number }) {
 }
 
 const SETTINGS_TAB_META = {
+  permissions: { title: '系統權限', english: 'Permissions', icon: 'models', description: '一次完成 BiCaption 所需授權。' },
   subtitle: {
     title: '雙語字幕',
     english: 'Bilingual',
@@ -694,7 +777,7 @@ const SETTINGS_TAB_META = {
     description: '按住說話、放開送出，讓語音直接變成可用文字。',
   },
   models: {
-    title: '模型',
+    title: '語音模型',
     english: 'Models',
     icon: 'models',
     description: '集中管理本地模型與雲端憑證。',
@@ -730,7 +813,7 @@ function getSessionStatusTone(state: string) {
 }
 
 function getTopStatusLabel(
-  tab: 'subtitle' | 'meeting' | 'dictation' | 'models',
+  tab: 'subtitle' | 'meeting' | 'dictation' | 'models' | 'permissions',
   options: {
     modelsReady: boolean;
     meetingModelsReady: boolean;
@@ -740,6 +823,7 @@ function getTopStatusLabel(
   },
 ) {
   switch (tab) {
+    case 'permissions': return '權限管理';
     case 'subtitle':
       return options.modelsReady ? '所有模型就緒' : '需要下載模型';
     case 'meeting':
@@ -769,7 +853,7 @@ function isAsrModelUnavailableInMode(modelKey: string, mode: SessionMode) {
   if (modelKey === 'breeze-asr-25') {
     return mode === 'subtitle';
   }
-  return (modelKey === 'whisper-mlx' || modelKey === 'groq-whisper') && mode !== 'dictation';
+  return (modelKey === 'whisper-mlx' || modelKey === 'groq-whisper' || modelKey === 'qwen3-asr' || modelKey === 'breeze-gguf') && mode !== 'dictation';
 }
 
 function isModelReady(status: ModelStatus | null, key: (typeof MODEL_LIBRARY)[number]['key']) {
@@ -780,6 +864,10 @@ function isModelReady(status: ModelStatus | null, key: (typeof MODEL_LIBRARY)[nu
       return status?.sensevoice ?? false;
     case 'breeze-asr-25':
       return status?.breezeAsr ?? false;
+    case 'qwen3-asr':
+      return status?.qwen3Asr ?? false;
+    case 'breeze-gguf':
+      return status?.breezeGguf ?? false;
     case 'vad':
       return status?.vad ?? false;
     default:
@@ -802,6 +890,8 @@ function isSessionModelReady(status: ModelStatus | null, modelKey: string) {
   const modelReadyMap: Record<string, boolean> = {
     'groq-whisper': true,
     'breeze-asr-25': status?.breezeAsr ?? false,
+    'qwen3-asr': status?.qwen3Asr ?? false,
+    'breeze-gguf': status?.breezeGguf ?? false,
     sensevoice: status?.sensevoice ?? false,
     'apple-stt': true,
   };
@@ -857,7 +947,7 @@ function getDictationPrimaryKeyLabel(binding: DictationHotkeyBinding) {
   }
 }
 
-function getRewriteBackendLabel(backend: 'disabled' | 'rules' | 'cloud-llm' | 'local-llm' | null) {
+function getRewriteBackendLabel(backend: 'disabled' | 'rules' | 'cloud-llm' | 'local-llm' | 'apple-intelligence' | null) {
   switch (backend) {
     case 'disabled':
       return '未整理';
@@ -867,12 +957,15 @@ function getRewriteBackendLabel(backend: 'disabled' | 'rules' | 'cloud-llm' | 'l
       return '雲端 LLM';
     case 'local-llm':
       return '本地 LLM';
+    case 'apple-intelligence':
+      return 'Apple 智慧';
     default:
       return '尚無結果';
   }
 }
 
 function getRewriteFallbackLabel(reason: string | null) {
+  if (reason?.startsWith('apple_intelligence_')) return 'Apple 智慧暫時無法潤飾，已使用原本辨識結果。';
   switch (reason) {
     case 'cloud_rewrite_unavailable':
       return '雲端 rewrite provider 尚未接入，已回退。';
@@ -916,7 +1009,7 @@ function SettingsView({
   modelStatus: ModelStatus | null;
   onSave: (partial: Partial<AppSettings>) => Promise<void>;
 }) {
-  const [activeSettingsTab, setActiveSettingsTab] = useState<'subtitle' | 'dictation' | 'meeting' | 'models'>('subtitle');
+  const [activeSettingsTab, setActiveSettingsTab] = useState<'subtitle' | 'dictation' | 'meeting' | 'models' | 'permissions'>('subtitle');
   const [draft, updateDraft] = useState(settings);
   const [saveStatus, setSaveStatus] = useState<SettingsSaveStatus>('saved');
   const saveQueueRef = useRef<SettingsSaveQueue<AppSettings> | null>(null);
@@ -931,26 +1024,16 @@ function SettingsView({
   async function savePreferences() {
     await saveQueueRef.current?.flush();
   }
-  const [showSetup, setShowSetup] = useState(false);
-  const setupDialogRef = useRef<HTMLDialogElement | null>(null);
   const setupPromptedRef = useRef(false);
+  const [permissionActionsTarget, setPermissionActionsTarget] = useState<HTMLDivElement | null>(null);
   const handleSetupPermissions = useCallback((ready: boolean) => {
     try {
       if (ready) localStorage.setItem('bicaption.setup.completed', '1');
       else if (!setupPromptedRef.current && !localStorage.getItem('bicaption.setup.completed') && !localStorage.getItem('bicaption.setup.dismissed')) {
-        setupPromptedRef.current = true; setShowSetup(true);
+        setupPromptedRef.current = true; setActiveSettingsTab('permissions');
       }
-    } catch { /* Storage unavailable: manual setup remains accessible. */ }
+    } catch { /* Optional preference. */ }
   }, []);
-  function closeSetup() {
-    try { localStorage.setItem('bicaption.setup.dismissed', '1'); } catch { /* optional preference */ }
-    setShowSetup(false);
-  }
-  useEffect(() => {
-    const dialog = setupDialogRef.current;
-    if (showSetup && dialog && !dialog.open) dialog.showModal();
-    else if (!showSetup && dialog?.open) dialog.close();
-  }, [showSetup]);
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
   const inputDevices = devices.filter((d) => d.kind === 'input' || d.kind === 'duplex');
   const loopbackDevices = devices.filter((d) => d.kind === 'duplex');
@@ -982,8 +1065,20 @@ function SettingsView({
   const inputMonitoringPermissionGranted = inputMonitoringPermission?.trusted === true;
   const needsDictationPermission = dictationPermissionSummary.missing.length > 0 || !accessibilityPermission || !inputMonitoringPermission;
   const showDictationPermissionCard = needsDictationPermission || dictationPermissionReadyToRestart;
-  const cloudLlmEnabled = draft.dictationRewriteMode === 'rules-and-cloud';
-  const localLlmEnabled = draft.dictationRewriteMode === 'rules-and-local-llm';
+  const appleIntelligenceEnabled = draft.dictationAppleIntelligenceEnabled;
+  const [appleIntelligenceStatus, setAppleIntelligenceStatus] = useState<import('../electron/types.js').AppleIntelligenceReply | null>(null);
+  useEffect(() => {
+    if (activeSettingsTab !== 'dictation') return;
+    let cancelled = false;
+    void window.app.checkAppleIntelligence().then(status => {
+      if (!cancelled) setAppleIntelligenceStatus(status);
+    }).catch(() => {
+      if (!cancelled) setAppleIntelligenceStatus({status: 'error'});
+    });
+    return () => { cancelled = true; };
+  }, [activeSettingsTab, appleIntelligenceEnabled]);
+  const cloudLlmEnabled = !appleIntelligenceEnabled && draft.dictationRewriteMode === 'rules-and-cloud';
+  const localLlmEnabled = !appleIntelligenceEnabled && draft.dictationRewriteMode === 'rules-and-local-llm';
   const onlineSttEnabled = draft.dictationSttModel === 'groq-whisper';
   const cloudModelSelection = GROQ_MODEL_OPTIONS.some((option) => option.value === draft.dictationCloudModel)
     ? draft.dictationCloudModel
@@ -996,7 +1091,9 @@ function SettingsView({
   const subtitleModelEntries = MODEL_LIBRARY.map((entry) => ({
     ...entry,
     ready: isModelReady(localModelStatus, entry.key),
-    runtimeAvailable: entry.key !== 'breeze-asr-25' || Boolean(localModelStatus?.breezeAsrRuntime),
+    runtimeAvailable: (entry.key !== 'breeze-asr-25' || Boolean(localModelStatus?.breezeAsrRuntime))
+      && (entry.key !== 'qwen3-asr' || Boolean(localModelStatus?.qwen3AsrRuntime))
+      && (entry.key !== 'breeze-gguf' || Boolean(localModelStatus?.breezeGgufRuntime)),
   }));
   const subtitleAsrOptions = SUBTITLE_ASR_MODEL_OPTIONS.map((option) => {
     const disabled = draft.sourceLang === 'auto' && !sttModelSupportsAutoDetect(option.key);
@@ -1007,27 +1104,30 @@ function SettingsView({
     };
   });
   const dictationAsrOptions = getAsrOptionsForMode('dictation').map((option) => {
-    const disabled = option.disabled || (option.key === 'breeze-asr-25' && !localModelStatus?.breezeAsr);
+    const disabled = option.disabled
+      || (option.key === 'breeze-asr-25' && !localModelStatus?.breezeAsr)
+      || (option.key === 'qwen3-asr' && !localModelStatus?.qwen3Asr)
+      || (option.key === 'breeze-gguf' && !localModelStatus?.breezeGguf);
     return {
       ...option,
       disabled,
       note: disabled && option.key === 'breeze-asr-25'
         ? '需先下載模型，且 App 必須含 Breeze runtime'
-        : option.note,
+        : disabled && (option.key === 'qwen3-asr' || option.key === 'breeze-gguf')
+          ? '需先在「模型」頁下載（僅開發版）'
+          : option.note,
     };
   });
-  const meetingAsrOptions = getAsrOptionsForMode('meeting').map((option) => {
-    const disabled = option.disabled
-      || (option.key === 'breeze-asr-25' && !localModelStatus?.breezeAsr)
+  const meetingAsrOptions = MEETING_ASR_MODEL_OPTIONS.map((option) => {
+    const needsBreezeModel = option.key === 'breeze-asr-25' && !localModelStatus?.breezeAsr;
+    const disabled = needsBreezeModel
       || (draft.meetingSourceLang === 'auto' && !sttModelSupportsAutoDetect(option.key));
     return {
       ...option,
       disabled,
-      note: disabled && option.key === 'breeze-asr-25'
+      note: needsBreezeModel
         ? '需先下載模型，且 App 必須含 Breeze runtime'
-        : disabled && !option.disabled
-          ? `${option.note} / 不支援自動偵測`
-          : option.note,
+        : disabled ? `${option.note} / 不支援自動偵測` : option.note,
     };
   });
   const meetingTurns = useMemo(() => buildMeetingTurns(meetingViewState.entries), [meetingViewState.entries]);
@@ -1066,10 +1166,11 @@ function SettingsView({
     },
     {
       key: 'models',
-      label: '模型',
+      label: '語音模型',
       english: SETTINGS_TAB_META.models.english,
       icon: SETTINGS_TAB_META.models.icon,
     },
+    { key: 'permissions', label: '系統權限', english: SETTINGS_TAB_META.permissions.english, icon: SETTINGS_TAB_META.permissions.icon },
   ] as const;
   function resetMeetingWorkspace() {
     meetingViewState.clearEntries();
@@ -1402,8 +1503,6 @@ function SettingsView({
             <p className="va-description">{activeTabMeta.description}</p>
           </div>
           <div className="va-header-actions">
-            <button className="button-secondary" onClick={() => setShowSetup(true)}>使用準備</button>
-
             <div className="va-top-pill">
               <span className="va-top-pill-check" aria-hidden="true">✓</span>
               <span>{topStatusLabel}</span>
@@ -1411,18 +1510,18 @@ function SettingsView({
           </div>
         </header>
 
-        <dialog className="setup-dialog" ref={setupDialogRef} aria-label="使用準備" onCancel={closeSetup}>
+        <div className="va-content va-permissions-page" hidden={activeSettingsTab !== 'permissions'}>
         <SetupPanel
-          onClose={closeSetup}
+          actionTarget={permissionActionsTarget}
           onPermissionsResolved={handleSetupPermissions}
-          sttModel={activeSettingsTab === 'meeting' ? draft.meetingSttModel : draft.sttModel}
-          source={activeSettingsTab === 'meeting' ? draft.meetingSourceLang : draft.sourceLang}
-          target={activeSettingsTab === 'meeting' ? draft.meetingTargetLang : draft.targetLang}
-          translationEnabled={(activeSettingsTab === 'meeting' ? draft.meetingTranslateModel : draft.translateModel) === 'apple-translation'}
+          sttModel={draft.translateModel === 'apple-translation' ? draft.sttModel : draft.meetingSttModel}
+          source={draft.translateModel === 'apple-translation' ? draft.sourceLang : draft.meetingSourceLang}
+          target={draft.translateModel === 'apple-translation' ? draft.targetLang : draft.meetingTargetLang}
+          translationEnabled={[draft.translateModel, draft.meetingTranslateModel].includes('apple-translation')}
           needsSpeech={[draft.sttModel, draft.meetingSttModel, draft.dictationSttModel].includes('apple-stt')}
         />
-        </dialog>
-        <div className={`va-content va-content-${activeSettingsTab}`}>
+        </div>
+        <div className={`va-content va-content-${activeSettingsTab}`} hidden={activeSettingsTab === 'permissions'}>
         {activeSettingsTab === 'dictation' && (
         <div className="va-grid-panel va-grid-panel-dictation">
           <article className="va-card va-hero-card">
@@ -1509,7 +1608,7 @@ function SettingsView({
                   ))}
                 </div>
               </div>
-              {showDictationPermissionCard && <p className="model-hint">從「使用準備」完成權限，最後統一重新開啟。</p>}
+              {showDictationPermissionCard && <p className="model-hint">前往「系統權限」完成授權。</p>}
               {hotkeyValidation.error ? <p className="error-text">{hotkeyValidation.error}</p> : null}
               {!hotkeyValidation.error && hotkeyValidation.warning ? <p className="model-hint">{hotkeyValidation.warning}</p> : null}
               {hotkeyTestError ? <p className="error-text">{hotkeyTestError}</p> : null}
@@ -1530,6 +1629,7 @@ function SettingsView({
                   value={draft.dictationDeviceId}
                   onChange={(event) => setDraft({ ...draft, dictationDeviceId: event.target.value })}
                 >
+                  <option value={SYSTEM_DEFAULT_DEVICE_ID}>跟隨系統預設輸入裝置</option>
                   {inputDevices.map((device) => (
                     <option key={device.id} value={device.id}>{device.label}</option>
                   ))}
@@ -1543,7 +1643,11 @@ function SettingsView({
                     ? 'Groq Whisper 適合混語與專有名詞。'
                     : draft.dictationSttModel === 'breeze-asr-25'
                       ? 'Breeze 會在放開按鍵後離線批次辨識，適合台灣中文與中英混說。'
-                      : 'Apple STT / 本地模型較適合快速回應。'}</p>
+                      : draft.dictationSttModel === 'breeze-gguf'
+                        ? 'Breeze 輕量版專為台灣中文與中英混說調校，我們的測試中最準；使用中約佔 1.4 GB 記憶體，閒置 3 分鐘後釋放，放開後約 1 秒出字且不帶標點（建議開啟潤飾）。'
+                        : draft.dictationSttModel === 'qwen3-asr'
+                        ? 'Qwen3-ASR 會參考你的個人詞庫與熱詞，中英夾雜最準；使用中約佔 1 GB 記憶體，閒置 3 分鐘後釋放。'
+                        : 'Apple STT / 本地模型較適合快速回應。'}</p>
                 </div>
                 <select
                   value={draft.dictationSttModel}
@@ -1572,36 +1676,46 @@ function SettingsView({
             </div>
           </article>
 
-          <article className="va-card va-card-bodyless">
+          <article className="va-card va-card-bodyless va-card-feature">
             <div className="bc-card-header">
-              <h3 className="bc-card-title">LLM 潤稿</h3>
-              <p className="bc-card-hint">可選擇雲端或本地 LLM，幫你修正錯字、斷句與專有名詞。</p>
+              <h3 className="bc-card-title">AI 潤飾</h3>
+              <p className="bc-card-hint">修正錯字與斷句，保留原意與中英用語。</p>
             </div>
             <div className="bc-card-body">
-              <div className="va-choice-grid">
+              <div className="va-choice-grid va-rewrite-options">
                 {[
                   {
+                    key: 'apple-intelligence',
+                    title: 'Apple 智慧潤飾',
+                    hint: 'Mac 內建 · 完全離線',
+                    icon: 'models',
+                  },
+                  {
                     key: 'rules-and-cloud',
-                    title: 'Groq 雲端潤稿',
+                    title: 'Groq 雲端潤飾',
                     hint: '準確、快速，需 API Key',
                     icon: 'cloud',
                   },
                   {
                     key: 'rules-and-local-llm',
-                    title: '本地 LLM 潤稿',
+                    title: '本地 LLM 潤飾',
                     hint: 'Qwen 2.5 3B · 完全離線',
                     icon: 'models',
                   },
                 ].map((option) => {
-                  const active = draft.dictationRewriteMode === option.key;
+                  const active = option.key === 'apple-intelligence'
+                    ? appleIntelligenceEnabled
+                    : !appleIntelligenceEnabled && draft.dictationRewriteMode === option.key;
                   return (
                     <button
                       key={option.key}
                       type="button"
+                      aria-pressed={active}
                       className={active ? 'va-choice-card active' : 'va-choice-card'}
                       onClick={() => setDraft({
                         ...draft,
-                        dictationRewriteMode: active ? 'rules' : option.key as AppSettings['dictationRewriteMode'],
+                        dictationAppleIntelligenceEnabled: option.key === 'apple-intelligence' && !active,
+                        dictationRewriteMode: active || option.key === 'apple-intelligence' ? 'rules' : option.key as AppSettings['dictationRewriteMode'],
                         dictationCloudEnhancementEnabled: option.key === 'rules-and-cloud' ? !active : false,
                       })}
                     >
@@ -1617,6 +1731,15 @@ function SettingsView({
                   );
                 })}
               </div>
+              {appleIntelligenceEnabled && appleIntelligenceStatus?.status !== 'available' && (
+                <p className="bc-card-hint" role="status">
+                  {appleIntelligenceStatus?.reason === 'not_enabled'
+                    ? '請先在系統設定啟用 Apple Intelligence。'
+                    : appleIntelligenceStatus?.reason === 'model_not_ready'
+                      ? 'Apple 模型尚未就緒；暫時使用原本結果。'
+                      : appleIntelligenceStatus ? '目前無法使用；將保留原本辨識結果。' : '正在確認可用性…'}
+                </p>
+              )}
               {(cloudLlmEnabled || onlineSttEnabled) && (
                 <>
                   <div className="va-divider" />
@@ -1636,7 +1759,7 @@ function SettingsView({
                   </div>
                 </>
               )}
-              {(cloudLlmEnabled || localLlmEnabled) && (
+              {(appleIntelligenceEnabled || cloudLlmEnabled || localLlmEnabled) && (
                 <>
                   <div className="va-divider" />
                   <div className="va-row va-row-align-top">
@@ -1661,6 +1784,7 @@ function SettingsView({
                       </button>
                     </div>
                   </div>
+                  {!appleIntelligenceEnabled && <>
                   <div className="va-divider" />
                   <div className="va-stack-row">
                     <div className="va-row-copy">
@@ -1679,6 +1803,7 @@ function SettingsView({
                       placeholder="輸入你的潤稿 Prompt..."
                     />
                   </div>
+                  </>}
                 </>
               )}
             </div>
@@ -1691,7 +1816,7 @@ function SettingsView({
           <div className="subtitle-grid-panel">
             <article className="va-card subtitle-language-card">
               <div className="bc-card-header">
-                <h3 className="bc-card-title">語言 / Languages</h3>
+                <h3 className="bc-card-title">語言設定</h3>
                 <p className="bc-card-hint">辨識來源語言，並選擇翻譯目標。</p>
               </div>
               <div className="subtitle-language-body">
@@ -1758,6 +1883,7 @@ function SettingsView({
               </div>
             </article>
 
+            <div className="subtitle-settings-column">
             <article className="va-card va-card-bodyless">
               <div className="bc-card-header">
                 <h3 className="bc-card-title">音訊來源</h3>
@@ -1766,7 +1892,6 @@ function SettingsView({
               <div className="bc-card-body">
                 <div className="bc-device-row">
                   <div className="bc-device-copy">
-                    <span className="bc-device-icon bc-device-icon-rose">◍</span>
                     <div>
                       <strong>麥克風</strong>
                     </div>
@@ -1786,7 +1911,6 @@ function SettingsView({
                 <div className="bc-row-divider" />
                 <div className="bc-device-row">
                   <div className="bc-device-copy">
-                    <span className="bc-device-icon bc-device-icon-sky">⋯</span>
                     <div>
                       <strong>系統音訊</strong>
                       <p>用於捕捉會議軟體或影片的聲音。</p>
@@ -1812,74 +1936,11 @@ function SettingsView({
                   <div className="bc-inline-permission">
                     <div className="bc-inline-permission-copy">
                       <strong className="hotkey-permission-missing">螢幕錄製未授權</strong>
-                      <p>請在系統設定允許 BiCaption 使用螢幕與系統音訊錄製。</p>
-                    </div>
-                    <div className="bc-inline-permission-actions">
-                      <button
-                        className="secondary"
-                        onClick={async () => {
-                          setSubtitleActionError(null);
-                          setShowSetup(true);
-                        }}
-                      >
-                        授權
-                      </button>
+                      <p className="model-hint">請從左側「系統權限」完成授權。</p>
                     </div>
                     {subtitleActionError && <p className="error-text">{subtitleActionError}</p>}
                   </div>
                 )}
-              </div>
-            </article>
-
-            <article className="va-card va-card-bodyless">
-              <div className="bc-card-header">
-                <h3 className="bc-card-title">浮動視窗外觀</h3>
-                <p className="bc-card-hint">調整字幕視窗的透明度與字體大小。</p>
-              </div>
-              <div className="bc-card-body">
-                <div className="bc-slider-row">
-                  <div className="bc-slider-copy">
-                    <strong>透明度</strong>
-                  </div>
-                  <div className="bc-slider-control">
-                    <input type="range" min="0.3" max="1" step="0.05" value={draft.overlayOpacity} onChange={(event) => setDraft({ ...draft, overlayOpacity: Number(event.target.value) })} />
-                    <span>{Math.round(draft.overlayOpacity * 100)}%</span>
-                  </div>
-                </div>
-                <div className="bc-row-divider" />
-                <div className="bc-slider-row">
-                  <div className="bc-slider-copy">
-                    <strong>字體大小</strong>
-                  </div>
-                  <div className="bc-slider-control">
-                    <input type="range" min="0.8" max="1.8" step="0.1" value={draft.overlayFontScale} onChange={(event) => setDraft({ ...draft, overlayFontScale: Number(event.target.value) })} />
-                    <span>{draft.overlayFontScale.toFixed(1)}×</span>
-                  </div>
-                </div>
-                <div className="bc-row-divider" />
-                <div className="bc-slider-row">
-                  <div className="bc-slider-copy">
-                    <strong>翻譯觸發延遲</strong>
-                    <p>讓句子停穩多久後再翻譯。太短會頻繁重譯。</p>
-                  </div>
-                  <div className="bc-slider-control">
-                    <input type="range" min="200" max="2000" step="100" value={draft.partialStableMs} onChange={(event) => setDraft({ ...draft, partialStableMs: Number(event.target.value) })} />
-                    <span>{draft.partialStableMs}ms</span>
-                  </div>
-                </div>
-                <div className="bc-inline-permission-actions">
-              <button
-                className="button-secondary va-button-secondary"
-                type="button"
-                onClick={async () => {
-                  setSubtitleActionError(null);
-                  try { await savePreferences(); await window.app.showOverlay(); }
-                  catch (error) { setSubtitleActionError(error instanceof Error ? error.message : '無法開啟字幕預覽'); }
-                }}
-              >
-                預覽字幕視窗
-              </button>
-                </div>
               </div>
             </article>
 
@@ -1935,6 +1996,60 @@ function SettingsView({
 
               </div>
             </article>
+            </div>
+
+            <div className="subtitle-settings-column">
+            <article className="va-card va-card-bodyless">
+              <div className="bc-card-header">
+                <h3 className="bc-card-title">浮動視窗外觀</h3>
+                <p className="bc-card-hint">調整字幕視窗的透明度與字體大小。</p>
+              </div>
+              <div className="bc-card-body">
+                <div className="bc-slider-row">
+                  <div className="bc-slider-copy">
+                    <strong>透明度</strong>
+                  </div>
+                  <div className="bc-slider-control">
+                    <input type="range" min="0.3" max="1" step="0.05" value={draft.overlayOpacity} onChange={(event) => setDraft({ ...draft, overlayOpacity: Number(event.target.value) })} />
+                    <span>{Math.round(draft.overlayOpacity * 100)}%</span>
+                  </div>
+                </div>
+                <div className="bc-row-divider" />
+                <div className="bc-slider-row">
+                  <div className="bc-slider-copy">
+                    <strong>字體大小</strong>
+                  </div>
+                  <div className="bc-slider-control">
+                    <input type="range" min="0.8" max="1.8" step="0.1" value={draft.overlayFontScale} onChange={(event) => setDraft({ ...draft, overlayFontScale: Number(event.target.value) })} />
+                    <span>{draft.overlayFontScale.toFixed(1)}×</span>
+                  </div>
+                </div>
+                <div className="bc-row-divider" />
+                <div className="bc-slider-row">
+                  <div className="bc-slider-copy">
+                    <strong>翻譯觸發延遲</strong>
+                    <p>讓句子停穩多久後再翻譯。太短會頻繁重譯。</p>
+                  </div>
+                  <div className="bc-slider-control">
+                    <input type="range" min="200" max="2000" step="100" value={draft.partialStableMs} onChange={(event) => setDraft({ ...draft, partialStableMs: Number(event.target.value) })} />
+                    <span>{draft.partialStableMs}ms</span>
+                  </div>
+                </div>
+                <div className="bc-inline-permission-actions">
+              <button
+                className="button-secondary va-button-secondary"
+                type="button"
+                onClick={async () => {
+                  setSubtitleActionError(null);
+                  try { await savePreferences(); await window.app.showOverlay(); }
+                  catch (error) { setSubtitleActionError(error instanceof Error ? error.message : '無法開啟字幕預覽'); }
+                }}
+              >
+                預覽字幕視窗
+              </button>
+                </div>
+              </div>
+            </article>
 
             <article className="va-card va-card-bodyless">
               <div className="bc-card-header">
@@ -1974,6 +2089,7 @@ function SettingsView({
                 )}
               </div>
             </article>
+            </div>
           </div>
         </div>
         )}
@@ -2102,20 +2218,18 @@ function SettingsView({
             <article className="va-card va-card-bodyless va-meeting-copilot-card">
               <div className="bc-card-header">
                 <h3 className="bc-card-title">會議洞察</h3>
-                <p className="bc-card-hint">手動用 Groq 根據目前逐字稿整理摘要、議題與提醒。</p>
+                <p className="bc-card-hint">Apple 智慧在 Mac 上分析最近一段逐字稿。</p>
               </div>
               <div className="bc-card-body va-meeting-copilot-body">
                 <button
                   className="button-secondary"
                   type="button"
-                  disabled={!hasMeetingTranscript || isMeetingCopilotLoading || !draft.dictationCloudApiKey.trim()}
+                  disabled={!hasMeetingTranscript || isMeetingCopilotLoading}
                   onClick={handleGenerateMeetingCopilotInsights}
                 >
                   {isMeetingCopilotLoading ? '產生中' : '產生洞察'}
                 </button>
-                {!draft.dictationCloudApiKey.trim() ? (
-                  <p className="model-hint">需要先在「模型」頁設定 Groq API Key。</p>
-                ) : !hasMeetingTranscript ? (
+                {!hasMeetingTranscript ? (
                   <p className="model-hint">開始會議並累積逐字稿後即可產生。</p>
                 ) : null}
                 {meetingCopilotError ? <p className="error-text">{meetingCopilotError}</p> : null}
@@ -2309,15 +2423,7 @@ function SettingsView({
                   <div className="bc-inline-permission">
                     <div className="bc-inline-permission-copy">
                       <strong className="hotkey-permission-missing">螢幕錄製未授權</strong>
-                      <p>請在系統設定允許 BiCaption 使用螢幕與系統音訊錄製。</p>
-                    </div>
-                    <div className="bc-inline-permission-actions">
-                      <button className="secondary" onClick={async () => {
-                        setSubtitleActionError(null);
-                        setShowSetup(true);
-                      }}>
-                        授權
-                      </button>
+                      <p className="model-hint">請從左側「系統權限」完成授權。</p>
                     </div>
                   </div>
                 ) : null}
@@ -2362,7 +2468,6 @@ function SettingsView({
                 <div className="va-row">
                   <div className="va-row-copy">
                     <strong>語音辨識引擎</strong>
-                    {!sttModelSupportsAutoDetect(draft.meetingSttModel) ? <p>Apple STT 不支援多語自動判斷。</p> : null}
                     {draft.meetingSttModel === 'sensevoice' ? <p>SenseVoice 適合多人交替說話情境。</p> : null}
                     {draft.meetingSttModel === 'breeze-asr-25' ? <p>Breeze 會在偵測到說話停頓後辨識該段，適合台灣中文與中英混說；不提供連續 partial 字幕。</p> : null}
                   </div>
@@ -2472,7 +2577,9 @@ function SettingsView({
           {saveStatus === 'error' && <button className="button-secondary" onClick={() => { void savePreferences().catch(() => {}); }}>重試保存</button>}
         </div>
         <div className="va-footer-actions">
-        {activeSettingsTab === 'subtitle' ? (
+        {activeSettingsTab === 'permissions' ? (
+          <div className="setup-footer-actions" ref={setPermissionActionsTarget} />
+        ) : activeSettingsTab === 'subtitle' ? (
           <>
             <button className="button-secondary button-session-action" disabled={!isSubtitleStreaming} onClick={() => window.app.stopSession()}>
               停止
@@ -2611,9 +2718,7 @@ export function App() {
       if (!loadedSettings.subtitleDeviceId || (loadedSettings.subtitleDeviceId !== '__disabled__' && !inputDeviceIds.has(loadedSettings.subtitleDeviceId))) {
         loadedSettings = { ...loadedSettings, subtitleDeviceId: preferred?.id ?? '' };
       }
-      if (!loadedSettings.dictationDeviceId || !inputDeviceIds.has(loadedSettings.dictationDeviceId)) {
-        loadedSettings = { ...loadedSettings, dictationDeviceId: preferred?.id ?? '' };
-      }
+      loadedSettings = { ...loadedSettings, dictationDeviceId: resolveDictationDeviceId(loadedSettings.dictationDeviceId, loadedDevices) };
       if (!loadedSettings.meetingMicDeviceId || !inputDeviceIds.has(loadedSettings.meetingMicDeviceId)) {
         loadedSettings = { ...loadedSettings, meetingMicDeviceId: preferred?.id ?? '' };
       }

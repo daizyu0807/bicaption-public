@@ -28,7 +28,7 @@ function normalizeSubtitleSttModel(model: string | undefined, sourceLang: string
   if (sourceLang === 'auto' && candidate === 'apple-stt') {
     return 'sensevoice';
   }
-  if (!candidate || candidate === 'moonshine' || candidate === 'whisper-mlx' || candidate === 'groq-whisper' || candidate === 'breeze-asr-25') {
+  if (!candidate || candidate === 'moonshine' || candidate === 'whisper-mlx' || candidate === 'groq-whisper' || candidate === 'breeze-asr-25' || candidate === 'qwen3-asr' || candidate === 'breeze-gguf') {
     return sourceLang === 'auto' ? 'sensevoice' : 'apple-stt';
   }
   return candidate;
@@ -39,7 +39,7 @@ function normalizeMeetingSttModel(model: string | undefined, sourceLang: string 
   if (sourceLang === 'auto' && candidate === 'apple-stt') {
     return 'sensevoice';
   }
-  if (!candidate || candidate === 'moonshine' || candidate === 'whisper-mlx' || candidate === 'groq-whisper') {
+  if (!candidate || candidate === 'moonshine' || candidate === 'whisper-mlx' || candidate === 'groq-whisper' || candidate === 'qwen3-asr' || candidate === 'breeze-gguf') {
     return sourceLang === 'auto' ? 'sensevoice' : 'apple-stt';
   }
   return candidate;
@@ -82,10 +82,10 @@ function normalizeDictationLocalLlmModel(model: string | undefined): string {
 export const defaultSettings: AppSettings = {
   deviceId: '',
   subtitleDeviceId: '',
-  dictationDeviceId: '',
+  dictationDeviceId: '__system_default__',
   dictationEnabled: false,
   outputDeviceId: '',
-  dictationSttModel: 'apple-stt',
+  dictationSttModel: 'breeze-gguf',
   dictationSourceLang: 'zh-TW',
   dictationHotkey: {
     keyCode: 59,
@@ -94,7 +94,7 @@ export const defaultSettings: AppSettings = {
   sourceLang: 'en',
   targetLang: 'zh-TW',
   sttModel: 'apple-stt',
-  translateModel: 'disabled',
+  translateModel: 'apple-translation',
   subtitleChunkMs: 400,
   subtitlePartialStableMs: 500,
   subtitleVadMode: 'aggressive',
@@ -108,12 +108,16 @@ export const defaultSettings: AppSettings = {
   bestOf: 1,
   vadFilter: false,
   conditionOnPrev: false,
-  dictationOutputAction: 'copy',
+  dictationOutputAction: 'copy-and-paste',
   dictationRewriteMode: 'rules',
+  dictationAppleIntelligenceEnabled: true,
   dictationCloudEnhancementEnabled: false,
   dictationOutputStyle: 'polished',
   dictationMaxRewriteExpansionRatio: 1.3,
   dictationInitialPromptText: 'Claude, Anthropic, OpenAI, ChatGPT, Gemini',
+  dictationDictionaryEnabled: true,
+  dictationDictionaryText: '',
+  dictationHotwords: '',
   dictationVocabularyContext: `優先考慮以下類型的專有名詞：
 - AI agent 名稱
 - CLI 工具名
@@ -150,8 +154,10 @@ Gemini CLI`,
 4. 若個人詞彙表中出現候選專名，優先使用它們做還原。
 5. 如果原文明顯是在列舉重點、步驟、待辦、條件比較，或出現「第一點、第二點、第三點」這類訊號，請優先整理成清楚的編號或條列格式。
 6. 不得自行新增項目，只能重排與整理原文已經提到的內容。
-7. 繁體中文請使用全形標點。
-8. 只輸出整理後文字，不要解釋。
+7. 逐字稿通常沒有標點：請加上全形標點（，。？！、），標點前後不留空格，長句適度斷句。
+8. 英文詞一律保留英文，不得翻成中文，並修正大小寫（GitHub、PR、CI、TypeScript）。若明顯是英文技術詞被聽成發音相近的字，依上下文與詞彙表還原；沒把握就保持原樣。
+9. 刪除口頭禪與重複；說話者自我修正（「不對，是…」）時只保留更正後的內容。
+10. 只輸出整理後的純文字，不要 Markdown 粗體或符號，不要解釋。
 
 個人詞彙表：
 {personal_glossary}
@@ -189,10 +195,10 @@ Literal transcript:
   meetingMicDeviceId: '',
   meetingSystemAudioDeviceId: '',
   meetingSourceMode: 'dual',
-  meetingSourceLang: 'zh-TW',
+  meetingSourceLang: 'auto',
   meetingTargetLang: 'zh-TW',
-  meetingSttModel: 'apple-stt',
-  meetingTranslateModel: 'apple-translation',
+  meetingSttModel: 'sensevoice',
+  meetingTranslateModel: 'disabled',
   meetingSpeakerLabelsEnabled: true,
   meetingMicrophoneLabel: '我方',
   meetingSystemLabel: '遠端',
@@ -260,7 +266,7 @@ export function loadSettings(): AppSettings {
     ...defaultSettings,
     ...stored,
     subtitleDeviceId: stored.subtitleDeviceId ?? legacyDeviceId ?? '',
-    dictationDeviceId: stored.dictationDeviceId ?? legacyDeviceId ?? '',
+    dictationDeviceId: stored.dictationDeviceId || legacyDeviceId || defaultSettings.dictationDeviceId,
     dictationSourceLang: stored.dictationSourceLang ?? stored.sourceLang ?? defaultSettings.dictationSourceLang,
     dictationSttModel: normalizeDictationSttModel(
       stored.dictationSttModel ?? defaultSettings.dictationSttModel,
@@ -272,6 +278,7 @@ export function loadSettings(): AppSettings {
     dictationChunkMs: stored.dictationChunkMs ?? stored.chunkMs ?? defaultSettings.dictationChunkMs,
     dictationEndpointMs: defaultSettings.dictationEndpointMs,
     dictationRewriteMode: normalizeDictationRewriteMode(stored.dictationRewriteMode),
+    dictationAppleIntelligenceEnabled: stored.dictationAppleIntelligenceEnabled === true,
     dictationCloudApiKey: stored.dictationCloudApiKey ?? defaultSettings.dictationCloudApiKey,
     dictationCloudModel: stored.dictationCloudModel ?? defaultSettings.dictationCloudModel,
     dictationCloudLlmPrompt: stored.dictationCloudLlmPrompt ?? defaultSettings.dictationCloudLlmPrompt,

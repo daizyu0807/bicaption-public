@@ -11,6 +11,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const ignoredStderrPatterns = [
   'Disabling PyTorch because PyTorch >= 2.4 is required but found 2.2.2',
   'PyTorch was not found. Models won\'t be available',
+  // The experimental GGUF SenseVoice backend (ggml-metal) prints its start-up log straight to stderr; it is only noise.
+  'ggml_metal_',
 ];
 const ignoredStdoutPatterns = [
   'Intel MKL',

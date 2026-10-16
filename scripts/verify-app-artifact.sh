@@ -94,6 +94,25 @@ if [ -x "$SIDECAR" ]; then
   fi
 fi
 
+# ── 8b. transcribe.cpp runtime (Breeze ASR GGUF, Qwen3-ASR) ──
+SIDECAR_DIR="$APP/Contents/Resources/sidecar"
+if [ -f "$SIDECAR_DIR/transcribe-runtime.enabled" ]; then
+  pass "transcribe.cpp runtime marker present"
+  if find "$SIDECAR_DIR/_internal" -name "libtranscribe*.dylib" 2>/dev/null | grep -q .; then
+    pass "libtranscribe native library bundled"
+  else
+    fail "libtranscribe native library missing from the sidecar"
+  fi
+  PROBE_JSON=$("$SIDECAR" --transcribe-probe ${BICAPTION_VERIFY_GGUF:+--transcribe-model "$BICAPTION_VERIFY_GGUF"} ${BICAPTION_VERIFY_WAV:+--audio-path "$BICAPTION_VERIFY_WAV"} 2>/dev/null | tail -1) && PROBE_RC=0 || PROBE_RC=$?
+  if [ $PROBE_RC -eq 0 ]; then
+    pass "Sidecar --transcribe-probe succeeded: $PROBE_JSON"
+  else
+    fail "Sidecar --transcribe-probe failed: $PROBE_JSON"
+  fi
+else
+  info "transcribe.cpp runtime not bundled (Breeze GGUF / Qwen3 unavailable in this build)"
+fi
+
 # ── 9. Global hotkey helper ──
 HOTKEY="$APP/Contents/Resources/sidecar/global-hotkey"
 if [ -x "$HOTKEY" ]; then

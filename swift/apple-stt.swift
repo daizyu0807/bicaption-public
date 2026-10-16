@@ -49,7 +49,10 @@ class SpeechEngine {
     private var stopFallbackTimer: DispatchSourceTimer?
     private var restartFallbackTimer: DispatchSourceTimer?
 
-    init(locale: String) {
+    private let contextualStrings: [String]
+
+    init(locale: String, contextualStrings: [String] = []) {
+        self.contextualStrings = contextualStrings
         let loc = Locale(identifier: locale)
         guard let rec = SFSpeechRecognizer(locale: loc) else {
             emitJSON(["type": "error", "code": "no_recognizer",
@@ -118,6 +121,9 @@ class SpeechEngine {
             req.addsPunctuation = false
         }
         req.taskHint = .dictation
+        if !contextualStrings.isEmpty {
+            req.contextualStrings = contextualStrings
+        }
 
         request = req
         taskStartMs = nowMs()
@@ -528,6 +534,15 @@ if let idx = CommandLine.arguments.firstIndex(of: "--locale"),
     localeId = CommandLine.arguments[idx + 1]
 }
 
+// Parse --contextual-strings-json '["term", ...]' (optional vocabulary hints for dictation)
+var contextualStrings: [String] = []
+if let idx = CommandLine.arguments.firstIndex(of: "--contextual-strings-json"),
+   idx + 1 < CommandLine.arguments.count,
+   let data = CommandLine.arguments[idx + 1].data(using: .utf8),
+   let terms = try? JSONSerialization.jsonObject(with: data) as? [String] {
+    contextualStrings = Array(terms.filter { !$0.isEmpty }.prefix(100))
+}
+
 // Parse --pipe <path> (optional: write PCM to named pipe instead of stdout)
 var pipePath: String? = nil
 if let idx = CommandLine.arguments.firstIndex(of: "--pipe"),
@@ -547,6 +562,7 @@ if useAudioTap {
 }
 
 // 1. Request speech recognition authorization
+emitJSON(["type": "helper_process", "pid": ProcessInfo.processInfo.processIdentifier], to: .standardError)
 let authSem = DispatchSemaphore(value: 0)
 SFSpeechRecognizer.requestAuthorization { status in
     if status != .authorized {
@@ -566,7 +582,7 @@ authSem.wait()
 // 2. Start engine
 emitJSON(["type": "ready"])
 
-let engine = SpeechEngine(locale: localeId)
+let engine = SpeechEngine(locale: localeId, contextualStrings: contextualStrings)
 engine.start()
 
 // 3. Audio source

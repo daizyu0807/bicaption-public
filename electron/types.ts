@@ -35,6 +35,8 @@ export interface CaptionConfig {
   dictationCloudEnhancementEnabled?: boolean;
   dictationOutputStyle?: 'literal' | 'polished';
   dictationInitialPromptText?: string;
+  dictationDictionaryText?: string;
+  dictationHotwords?: string;
   dictationVocabularyContext?: string;
   dictationProperNounCorrectionEnabled?: boolean;
   dictationPersonalGlossary?: string;
@@ -121,7 +123,7 @@ export interface DictationFinalEvent extends SessionScopedEvent {
   finalText: string;
   initialPromptText?: string;
   matchedCorrections?: string[];
-  rewriteBackend: 'disabled' | 'rules' | 'cloud-llm' | 'local-llm';
+  rewriteBackend: 'disabled' | 'rules' | 'cloud-llm' | 'local-llm' | 'apple-intelligence';
   rewriteApplied: boolean;
   fallbackReason?: string;
   chunkCount?: number;
@@ -147,7 +149,7 @@ export interface DictationLearningRecord {
   literalTranscript: string;
   dictionaryText: string;
   finalText: string;
-  rewriteBackend: 'disabled' | 'rules' | 'cloud-llm' | 'local-llm';
+  rewriteBackend: 'disabled' | 'rules' | 'cloud-llm' | 'local-llm' | 'apple-intelligence';
   rewriteApplied: boolean;
   latencyMs: number;
   candidates: DictationLearningCandidate[];
@@ -293,10 +295,15 @@ export interface AppSettings {
   conditionOnPrev: boolean;
   dictationOutputAction: DictationOutputAction;
   dictationRewriteMode: 'disabled' | 'rules' | 'rules-and-cloud' | 'rules-and-local-llm';
+  dictationAppleIntelligenceEnabled: boolean;
   dictationCloudEnhancementEnabled: boolean;
   dictationOutputStyle: 'literal' | 'polished';
   dictationMaxRewriteExpansionRatio: number;
   dictationInitialPromptText: string;
+  dictationDictionaryEnabled: boolean;
+  dictationDictionaryText: string;
+  /** Words only the Qwen3-ASR hot-word list uses (most important first); the initial prompt also feeds Whisper engines. */
+  dictationHotwords: string;
   dictationVocabularyContext: string;
   dictationProperNounCorrectionEnabled: boolean;
   dictationPersonalGlossary: string;
@@ -343,22 +350,30 @@ export interface OverlayBounds {
 
 export interface ModelStatus {
   sensevoice: boolean;
-  mlxWhisper: boolean;
   breezeAsr: boolean;
   breezeAsrRuntime: boolean;
-  whisperTinyEn: boolean;
-  whisperSmall: boolean;
-  zipformerKo: boolean;
+  qwen3Asr: boolean;
+  qwen3AsrRuntime: boolean;
+  breezeGguf: boolean;
+  breezeGgufRuntime: boolean;
   vad: boolean;
   ffmpeg: boolean;
   ready: boolean;
 }
 
 export interface ModelDownloadProgress {
-  stage: 'sensevoice' | 'mlx-whisper' | 'breeze-asr-25' | 'whisper-tiny-en' | 'whisper-small' | 'zipformer-ko' | 'vad' | 'extracting';
+  stage: 'sensevoice' | 'breeze-asr-25' | 'qwen3-asr' | 'breeze-gguf' | 'vad' | 'extracting';
   percent: number;
   downloadedMB: number;
   totalMB: number;
+}
+
+export interface AppleIntelligenceReply {
+  status: 'ok' | 'available' | 'unavailable' | 'error';
+  text?: string;
+  reason?: string;
+  supportsChinese?: boolean;
+  supportsEnglish?: boolean;
 }
 
 export interface AppleTranslationStatus {

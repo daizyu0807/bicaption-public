@@ -11,6 +11,11 @@ const fs = require('fs');
 /**
  * @param {import('electron-builder').AfterPackContext} context
  */
+// An ad-hoc signature's default designated requirement is the exact cdhash, so every rebuild looked like a different
+// app to TCC and silently dropped the microphone / accessibility / screen-recording grants. Pin the requirement to the
+// bundle identifier instead; the grants then survive rebuilds of this locally signed app.
+const identifierRequirement = (identifier) => `--requirements '=designated => identifier "${identifier}"'`;
+
 module.exports = async function afterPack(context) {
   if (process.platform !== 'darwin') return;
 
@@ -43,7 +48,7 @@ module.exports = async function afterPack(context) {
   if (fs.existsSync(sidecarBinary)) {
     console.log(`[afterPack] Signing sidecar with audio-input entitlement`);
     execSync(
-      `codesign --force --sign - --identifier "${bundleId}.sidecar" --entitlements "${entitlementsInherit}" "${sidecarBinary}"`,
+      `codesign --force --sign - --identifier "${bundleId}.sidecar" ${identifierRequirement(`${bundleId}.sidecar`)} --entitlements "${entitlementsInherit}" "${sidecarBinary}"`,
       { stdio: 'inherit' },
     );
     // Also sign all .dylib and .so files in the sidecar directory
@@ -63,11 +68,11 @@ module.exports = async function afterPack(context) {
     }
     console.log(`[afterPack] Signing AppleSTTHelper with identifier=${helperBundleId}`);
     execSync(
-      `codesign --force --sign - --identifier "${helperBundleId}" "${appleSttHelperBinary}"`,
+      `codesign --force --sign - --identifier "${helperBundleId}" ${identifierRequirement(helperBundleId)} "${appleSttHelperBinary}"`,
       { stdio: 'inherit' },
     );
     execSync(
-      `codesign --force --sign - --identifier "${helperBundleId}" "${appleSttHelperApp}"`,
+      `codesign --force --sign - --identifier "${helperBundleId}" ${identifierRequirement(helperBundleId)} "${appleSttHelperApp}"`,
       { stdio: 'inherit' },
     );
   } else {
@@ -78,11 +83,11 @@ module.exports = async function afterPack(context) {
     const helperBundleId = `${bundleId}.global-hotkey-helper`;
     console.log(`[afterPack] Signing GlobalHotkeyHelper with identifier=${helperBundleId}`);
     execSync(
-      `codesign --force --sign - --identifier "${helperBundleId}" "${globalHotkeyHelperBinary}"`,
+      `codesign --force --sign - --identifier "${helperBundleId}" ${identifierRequirement(helperBundleId)} "${globalHotkeyHelperBinary}"`,
       { stdio: 'inherit' },
     );
     execSync(
-      `codesign --force --sign - --identifier "${helperBundleId}" "${globalHotkeyHelperApp}"`,
+      `codesign --force --sign - --identifier "${helperBundleId}" ${identifierRequirement(helperBundleId)} "${globalHotkeyHelperApp}"`,
       { stdio: 'inherit' },
     );
   } else {
@@ -108,13 +113,13 @@ module.exports = async function afterPack(context) {
 
   // Sign the main binary with the correct identifier
   execSync(
-    `codesign --force --sign - --identifier "${bundleId}" --entitlements "${entitlements}" "${mainBinary}"`,
+    `codesign --force --sign - --identifier "${bundleId}" ${identifierRequirement(bundleId)} --entitlements "${entitlements}" "${mainBinary}"`,
     { stdio: 'inherit' },
   );
 
   // Sign the app bundle
   execSync(
-    `codesign --force --sign - --identifier "${bundleId}" --entitlements "${entitlements}" "${appPath}"`,
+    `codesign --force --sign - --identifier "${bundleId}" ${identifierRequirement(bundleId)} --entitlements "${entitlements}" "${appPath}"`,
     { stdio: 'inherit' },
   );
 

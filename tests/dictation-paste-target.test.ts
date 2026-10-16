@@ -4,18 +4,24 @@ import test from 'node:test';
 
 const mainSource = readFileSync(new URL('../electron/main.ts', import.meta.url), 'utf8');
 
-test('dictation captures the paste target before showing the recording overlay', () => {
+test('dictation records the paste target before the overlay is shown, without delaying the microphone', () => {
   const match = mainSource.match(
     /async function startDictationFromHotkey\(\) \{([\s\S]*?)\n\}\n\nfunction emitLocalDictationProcessingState/,
   );
   assert.ok(match, 'startDictationFromHotkey implementation should exist');
 
   const body = match[1];
-  const captureIndex = body.indexOf('pendingDictationPasteTarget = await getFrontmostFocusSnapshotWithRetry()');
-  const overlayIndex = body.indexOf('showDictationOverlay()');
+  const snapshotIndex = body.indexOf('getFrontmostFocusSnapshotWithRetry()');
+  const transitionIndex = body.indexOf('await runSessionTransition');
 
-  assert.notEqual(captureIndex, -1, 'paste target should be captured when dictation starts');
-  assert.notEqual(overlayIndex, -1, 'dictation overlay should still be shown');
-  assert.ok(captureIndex < overlayIndex, 'paste target must be captured before the overlay can affect focus');
-  assert.doesNotMatch(body, /pendingDictationPasteTarget = null/);
+  assert.notEqual(snapshotIndex, -1, 'paste target should be captured when dictation starts');
+  assert.ok(snapshotIndex < transitionIndex, 'the snapshot starts before the session, and runs concurrently with it');
+  // The only place the overlay is shown is the reveal closure, which runs from the snapshot callback or the timeout.
+  assert.equal(body.split('showDictationOverlay()').length - 1, 1, 'the overlay must not be shown directly');
+  assert.match(body, /const revealOverlay = \(\) => \{[\s\S]*?showDictationOverlay\(\);[\s\S]*?\};/);
+  assert.match(body, /setTimeout\(revealOverlay, DICTATION_SNAPSHOT_OVERLAY_TIMEOUT_MS\)/);
+  assert.match(body, /\.then\(\(snapshot\) => \{[\s\S]*?revealOverlay\(\);/);
+  assert.doesNotMatch(body, /= await getFrontmostFocusSnapshotWithRetry\(\)/, 'the snapshot must not block the microphone');
+  assert.match(body, /dictationSnapshotPending = true/);
+  assert.match(mainSource, /if \(!dictationSnapshotPending\) showDictationOverlay\(\)/, 'sidecar state events must not show the overlay early');
 });

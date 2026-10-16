@@ -10,37 +10,32 @@ import { getSidecarCommand, getSpawnCwd } from './paths.js';
 const SENSEVOICE_MODEL_DIR = 'sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17';
 const SENSEVOICE_ARCHIVE_URL =
   'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2';
-const WHISPER_TINY_EN_MODEL_DIR = 'sherpa-onnx-whisper-tiny.en';
-const WHISPER_TINY_EN_ARCHIVE_URL =
-  'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.en.tar.bz2';
-const WHISPER_SMALL_MODEL_DIR = 'sherpa-onnx-whisper-small';
-const WHISPER_SMALL_ARCHIVE_URL =
-  'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-small.tar.bz2';
-const ZIPFORMER_KOREAN_MODEL_DIR = 'sherpa-onnx-zipformer-korean-2024-06-24';
-const ZIPFORMER_KOREAN_ARCHIVE_URL =
-  'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-korean-2024-06-24.tar.bz2';
 const VAD_MODEL_FILE = 'silero_vad.onnx';
 const VAD_MODEL_URL =
   'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx';
-const DEFAULT_MLX_WHISPER_MODEL = process.env.BICAPTION_MLX_WHISPER_MODEL || 'mlx-community/whisper-large-v3-turbo';
 const BREEZE_ASR_MODEL_ID = 'Kenji8000/Breeze-ASR-25-mlx';
 const BREEZE_ASR_MODEL_REVISION = '56b8508317e7766d904d1f0b8cc612687dfa39a4';
 const BREEZE_ASR_RUNTIME_MARKER = 'breeze-asr-runtime.enabled';
+const TRANSCRIBE_RUNTIME_MARKER = 'transcribe-runtime.enabled';
+const QWEN3_ASR_MODEL_FILE = 'Qwen3-ASR-0.6B-Q4_K_M.gguf';
+const BREEZE_GGUF_MODEL_FILE = 'Breeze-ASR-25-Q4_K_M.gguf';
+const BREEZE_GGUF_MODEL_URL = 'https://huggingface.co/handy-computer/Breeze-ASR-25-gguf/resolve/main/Breeze-ASR-25-Q4_K_M.gguf';
+const QWEN3_ASR_MODEL_URL = 'https://huggingface.co/handy-computer/Qwen3-ASR-0.6B-gguf/resolve/main/Qwen3-ASR-0.6B-Q4_K_M.gguf';
 export interface ModelStatus {
   sensevoice: boolean;
-  mlxWhisper: boolean;
   breezeAsr: boolean;
   breezeAsrRuntime: boolean;
-  whisperTinyEn: boolean;
-  whisperSmall: boolean;
-  zipformerKo: boolean;
+  qwen3Asr: boolean;
+  qwen3AsrRuntime: boolean;
+  breezeGguf: boolean;
+  breezeGgufRuntime: boolean;
   vad: boolean;
   ffmpeg: boolean;
   ready: boolean;
 }
 
 export interface ModelDownloadProgress {
-  stage: 'sensevoice' | 'mlx-whisper' | 'breeze-asr-25' | 'whisper-tiny-en' | 'whisper-small' | 'zipformer-ko' | 'vad' | 'extracting';
+  stage: 'sensevoice' | 'breeze-asr-25' | 'qwen3-asr' | 'breeze-gguf' | 'vad' | 'extracting';
   percent: number;
   downloadedMB: number;
   totalMB: number;
@@ -64,13 +59,13 @@ export class ModelDownloader extends EventEmitter {
 
   checkStatus(): ModelStatus {
     const sensevoice = existsSync(join(this.pythonDir, SENSEVOICE_MODEL_DIR, 'model.int8.onnx'));
-    const mlxWhisperRuntimeReady = app.isPackaged ? true : this.checkPythonPackage('mlx-whisper');
-    const mlxWhisper = mlxWhisperRuntimeReady && this.checkMlxWhisperModelReady(DEFAULT_MLX_WHISPER_MODEL);
     const breezeAsrRuntime = this.checkBreezeAsrRuntimeReady();
     const breezeAsr = breezeAsrRuntime && this.checkBreezeAsrModelReady();
-    const whisperTinyEn = existsSync(join(this.pythonDir, WHISPER_TINY_EN_MODEL_DIR, 'tiny.en-encoder.int8.onnx'));
-    const whisperSmall = existsSync(join(this.pythonDir, WHISPER_SMALL_MODEL_DIR, 'small-encoder.int8.onnx'));
-    const zipformerKo = existsSync(join(this.pythonDir, ZIPFORMER_KOREAN_MODEL_DIR, 'encoder-epoch-99-avg-1.int8.onnx'));
+    // Packaged builds carry the transcribe.cpp runtime next to the sidecar and mark it; development builds use the venv.
+    const qwen3AsrRuntime = this.checkTranscribeRuntimeReady();
+    const qwen3Asr = qwen3AsrRuntime && existsSync(join(this.pythonDir, QWEN3_ASR_MODEL_FILE));
+    const breezeGgufRuntime = qwen3AsrRuntime;
+    const breezeGguf = breezeGgufRuntime && existsSync(join(this.pythonDir, BREEZE_GGUF_MODEL_FILE));
     const vad = existsSync(join(this.pythonDir, VAD_MODEL_FILE));
     let ffmpeg = false;
     try {
@@ -81,15 +76,15 @@ export class ModelDownloader extends EventEmitter {
     }
     return {
       sensevoice,
-      mlxWhisper,
       breezeAsr,
       breezeAsrRuntime,
-      whisperTinyEn,
-      whisperSmall,
-      zipformerKo,
+      qwen3AsrRuntime,
+      qwen3Asr,
+      breezeGgufRuntime,
+      breezeGguf,
       vad,
       ffmpeg,
-      ready: (sensevoice || mlxWhisper || whisperTinyEn || whisperSmall || zipformerKo) && vad,
+      ready: sensevoice && vad,
     };
   }
 
@@ -97,13 +92,11 @@ export class ModelDownloader extends EventEmitter {
     this.aborted = true;
   }
 
-  private static readonly MODEL_MAP: Record<string, { dir?: string; file?: string; url?: string; stage: 'sensevoice' | 'mlx-whisper' | 'breeze-asr-25' | 'whisper-tiny-en' | 'whisper-small' | 'zipformer-ko' | 'vad'; isArchive: boolean; isPythonPackage?: boolean; packageName?: string; isBreezeAsr?: boolean }> = {
+  private static readonly MODEL_MAP: Record<string, { dir?: string; file?: string; url?: string; stage: 'sensevoice' | 'breeze-asr-25' | 'qwen3-asr' | 'breeze-gguf' | 'vad'; isArchive: boolean; packageName?: string; isBreezeAsr?: boolean }> = {
     sensevoice: { dir: SENSEVOICE_MODEL_DIR, url: SENSEVOICE_ARCHIVE_URL, stage: 'sensevoice', isArchive: true },
-    'mlx-whisper': { stage: 'mlx-whisper', isArchive: false, isPythonPackage: true, packageName: 'mlx-whisper' },
     'breeze-asr-25': { stage: 'breeze-asr-25', isArchive: false, isBreezeAsr: true },
-    'whisper-tiny-en': { dir: WHISPER_TINY_EN_MODEL_DIR, url: WHISPER_TINY_EN_ARCHIVE_URL, stage: 'whisper-tiny-en', isArchive: true },
-    'whisper-small': { dir: WHISPER_SMALL_MODEL_DIR, url: WHISPER_SMALL_ARCHIVE_URL, stage: 'whisper-small', isArchive: true },
-    'zipformer-ko': { dir: ZIPFORMER_KOREAN_MODEL_DIR, url: ZIPFORMER_KOREAN_ARCHIVE_URL, stage: 'zipformer-ko', isArchive: true },
+    'qwen3-asr': { file: QWEN3_ASR_MODEL_FILE, url: QWEN3_ASR_MODEL_URL, stage: 'qwen3-asr', isArchive: false, packageName: 'transcribe-cpp' },
+    'breeze-gguf': { file: BREEZE_GGUF_MODEL_FILE, url: BREEZE_GGUF_MODEL_URL, stage: 'breeze-gguf', isArchive: false, packageName: 'transcribe-cpp' },
     vad: { file: VAD_MODEL_FILE, url: VAD_MODEL_URL, stage: 'vad', isArchive: false },
   };
 
@@ -117,10 +110,6 @@ export class ModelDownloader extends EventEmitter {
         throw new Error('此版本未包含 Breeze ASR runtime；請使用 BICAPTION_INCLUDE_BREEZE_ASR=1 建立專用版本。');
       }
       await this.prepareBreezeAsrModel();
-    } else if (entry.isPythonPackage) {
-      await this.installPythonPackage(entry.packageName!, 'mlx-whisper');
-      if (this.aborted) return;
-      await this.prepareMlxWhisperModel(DEFAULT_MLX_WHISPER_MODEL, 'mlx-whisper');
     } else if (entry.isArchive) {
       const archiveName = `${modelKey}.tar.bz2`;
       const archivePath = join(this.pythonDir, archiveName);
@@ -130,6 +119,10 @@ export class ModelDownloader extends EventEmitter {
       await this.extractTarBz2(archivePath, this.pythonDir);
       try { rmSync(archivePath); } catch {}
     } else {
+      if ((entry.stage === 'qwen3-asr' || entry.stage === 'breeze-gguf') && entry.packageName && !app.isPackaged && !this.checkPythonPackage(entry.packageName)) {
+        await this.installPythonPackage(entry.packageName, entry.stage);
+        if (this.aborted) return;
+      }
       await this.downloadFile(entry.url!, join(this.pythonDir, entry.file!), entry.stage);
     }
 
@@ -149,20 +142,6 @@ export class ModelDownloader extends EventEmitter {
           rmSync(repoDir, { recursive: true, force: true });
         } catch (error) {
           console.error(`Failed to delete Breeze ASR model cache: ${error}`);
-        }
-      }
-    } else if (entry.isPythonPackage) {
-      // For MLX Whisper, we only clear the model cache if it's managed.
-      const repoDir = join(
-        this.huggingFaceHome,
-        'hub',
-        `models--${DEFAULT_MLX_WHISPER_MODEL.replace(/\//g, '--')}`,
-      );
-      if (existsSync(repoDir)) {
-        try {
-          rmSync(repoDir, { recursive: true, force: true });
-        } catch (error) {
-          console.error(`Failed to delete MLX model cache: ${error}`);
         }
       }
     } else {
@@ -196,52 +175,9 @@ export class ModelDownloader extends EventEmitter {
       if (this.aborted) return;
     }
 
-    if (!status.mlxWhisper) {
-      await this.installPythonPackage('mlx-whisper', 'mlx-whisper');
-      if (this.aborted) return;
-      await this.prepareMlxWhisperModel(DEFAULT_MLX_WHISPER_MODEL, 'mlx-whisper');
-      if (this.aborted) return;
-    }
-
     if (!status.sensevoice) {
       const archivePath = join(this.pythonDir, 'sensevoice.tar.bz2');
       await this.downloadFile(SENSEVOICE_ARCHIVE_URL, archivePath, 'sensevoice');
-      if (this.aborted) return;
-
-      this.emitProgress({ stage: 'extracting', percent: 0, downloadedMB: 0, totalMB: 0 });
-      await this.extractTarBz2(archivePath, this.pythonDir);
-      try {
-        rmSync(archivePath);
-      } catch {}
-    }
-
-    if (!status.whisperTinyEn) {
-      const archivePath = join(this.pythonDir, 'whisper-tiny-en.tar.bz2');
-      await this.downloadFile(WHISPER_TINY_EN_ARCHIVE_URL, archivePath, 'whisper-tiny-en');
-      if (this.aborted) return;
-
-      this.emitProgress({ stage: 'extracting', percent: 0, downloadedMB: 0, totalMB: 0 });
-      await this.extractTarBz2(archivePath, this.pythonDir);
-      try {
-        rmSync(archivePath);
-      } catch {}
-    }
-
-    if (!status.whisperSmall) {
-      const archivePath = join(this.pythonDir, 'whisper-small.tar.bz2');
-      await this.downloadFile(WHISPER_SMALL_ARCHIVE_URL, archivePath, 'whisper-small');
-      if (this.aborted) return;
-
-      this.emitProgress({ stage: 'extracting', percent: 0, downloadedMB: 0, totalMB: 0 });
-      await this.extractTarBz2(archivePath, this.pythonDir);
-      try {
-        rmSync(archivePath);
-      } catch {}
-    }
-
-    if (!status.zipformerKo) {
-      const archivePath = join(this.pythonDir, 'zipformer-ko.tar.bz2');
-      await this.downloadFile(ZIPFORMER_KOREAN_ARCHIVE_URL, archivePath, 'zipformer-ko');
       if (this.aborted) return;
 
       this.emitProgress({ stage: 'extracting', percent: 0, downloadedMB: 0, totalMB: 0 });
@@ -343,7 +279,7 @@ export class ModelDownloader extends EventEmitter {
     }
   }
 
-  private installPythonPackage(packageName: string, stage: 'mlx-whisper'): Promise<void> {
+  private installPythonPackage(packageName: string, stage: 'qwen3-asr' | 'breeze-gguf'): Promise<void> {
     if (app.isPackaged) {
       this.emitProgress({ stage, percent: 100, downloadedMB: 0, totalMB: 0 });
       return Promise.resolve();
@@ -396,43 +332,16 @@ export class ModelDownloader extends EventEmitter {
     }
   }
 
-  private checkMlxWhisperModelReady(modelId: string): boolean {
-    if (app.isPackaged) {
-      const repoDir = join(
-        this.huggingFaceHome,
-        'hub',
-        `models--${modelId.replace(/\//g, '--')}`,
-      );
-      const refsMain = join(repoDir, 'refs', 'main');
-      const snapshotsDir = join(repoDir, 'snapshots');
-      return existsSync(refsMain) && existsSync(snapshotsDir);
-    }
-
-    try {
-      execFileSync(this.getPythonCommand(), [
-        '-c',
-        [
-          'import sys',
-          'from huggingface_hub import snapshot_download',
-          'snapshot_download(repo_id=sys.argv[1], local_files_only=True)',
-        ].join('; '),
-        modelId,
-      ], {
-        stdio: 'ignore',
-        env: {
-          ...process.env,
-          HF_HOME: this.huggingFaceHome,
-          HUGGINGFACE_HUB_CACHE: join(this.huggingFaceHome, 'hub'),
-        },
-      });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
   private getHuggingFaceRepoDir(modelId: string): string {
     return join(this.huggingFaceHome, 'hub', `models--${modelId.replace(/\//g, '--')}`);
+  }
+
+  private checkTranscribeRuntimeReady(): boolean {
+    if (!app.isPackaged) {
+      return this.checkPythonPackage('transcribe-cpp');
+    }
+    return Boolean(process.resourcesPath)
+      && existsSync(join(process.resourcesPath, 'sidecar', TRANSCRIBE_RUNTIME_MARKER));
   }
 
   private checkBreezeAsrRuntimeReady(): boolean {
@@ -482,45 +391,6 @@ export class ModelDownloader extends EventEmitter {
           resolve();
         } else {
           reject(new Error('Breeze ASR 25 下載或版本驗證失敗。'));
-        }
-      });
-      child.on('error', reject);
-    });
-  }
-
-  private prepareMlxWhisperModel(modelId: string, stage: 'mlx-whisper'): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const command = this.getPythonCommand();
-      this.emitProgress({ stage, percent: 40, downloadedMB: 0, totalMB: 0 });
-      const child = spawn(command, [
-        '-c',
-        [
-          'import sys',
-          'from huggingface_hub import snapshot_download',
-          'snapshot_download(repo_id=sys.argv[1])',
-        ].join('; '),
-        modelId,
-      ], {
-        cwd: process.cwd(),
-        env: {
-          ...process.env,
-          HF_HOME: this.huggingFaceHome,
-          HUGGINGFACE_HUB_CACHE: join(this.huggingFaceHome, 'hub'),
-        },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      child.stdout.on('data', () => {
-        this.emitProgress({ stage, percent: 80, downloadedMB: 0, totalMB: 0 });
-      });
-      child.stderr.on('data', () => {
-        this.emitProgress({ stage, percent: 80, downloadedMB: 0, totalMB: 0 });
-      });
-      child.on('exit', (code) => {
-        if (code === 0) {
-          this.emitProgress({ stage, percent: 100, downloadedMB: 0, totalMB: 0 });
-          resolve();
-        } else {
-          reject(new Error(`Failed to prepare MLX Whisper model ${modelId}`));
         }
       });
       child.on('error', reject);

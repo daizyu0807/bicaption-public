@@ -22,3 +22,15 @@ bicaption_include_breeze_asr() {
       ;;
   esac
 }
+
+# transcribe.cpp (Breeze ASR GGUF, Qwen3-ASR). Small (~9 MB), so it is bundled unless explicitly disabled.
+bicaption_include_transcribe_cpp() {
+  case "${BICAPTION_INCLUDE_TRANSCRIBE_CPP:-1}" in
+    0|false|FALSE|no|NO|off|OFF)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
